@@ -19,6 +19,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.memory.embeddings import FrameEmbedder  # noqa: E402
 from ash.memory.kdm import KeyMomentModel  # noqa: E402
 
@@ -48,7 +50,7 @@ def main() -> int:
     out: dict[str, np.ndarray] = {}
     for stem in sorted(p.stem for p in Path("data/corpus").glob("*.npy")):
         rect = detect(stem)
-        arr = np.load("data/corpus/%s.npy" % stem, mmap_mode="r")
+        arr = np.load(artifact(stem, "corpus-4fps"), mmap_mode="r")
         # (T, H, W, C): the spatial axes are 1 and 2.  Slicing the first two
         # indexes crops TIME, which is what an earlier version of this script did
         # - it embedded 217 "frames" of a 9405-frame video and reported a

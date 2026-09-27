@@ -31,10 +31,14 @@ import json
 import os
 import subprocess
 import sys
+
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import ash.data.video_pack as _vp  # noqa: E402
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -982,6 +986,30 @@ class Server(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 left -= len(chunk)
 
+
+    def _sync_pack(self) -> None:
+        """Keep data/videos/<stem>/meta.json in step with whatever was just saved.
+
+        The pack is the layout people and tools are meant to read, so if the page wrote only the
+        legacy files it would go stale and start lying.  Writing both is deliberate during the
+        transition; a stale pack would be worse than no pack.
+        """
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from ash.data.video_pack import load_meta, save_meta
+            meta = load_meta(type(self)._vp.stem_of(video)) or {"id": type(self)._vp.stem_of(video)}
+            meta.update({"id": type(self)._vp.stem_of(video),
+                         "video": type(self).video.name,
+                         "panel": list(type(self).panel),
+                         "panel_size": list(type(self).panel_size),
+                         "cells": {k: list(v) for k, v in type(self).cells.items()},
+                         "dir_proto": {k: list(v) for k, v in (type(self).dir_proto or {}).items()},
+                         "mapping": dict(type(self).mapping)})
+            save_meta(type(self)._vp.stem_of(video), meta)
+        except Exception as exc:                      # noqa: BLE001
+            print("could not update the video pack: %s" % exc)
+
     def do_POST(self) -> None:                       # noqa: N802
         if urlparse(self.path).path == "/api/cells":
             n = int(self.headers.get("Content-Length") or 0)
@@ -1004,6 +1032,7 @@ class Server(BaseHTTPRequestHandler):
             if proto:
                 type(self).dir_proto = proto      # scaled with the box, so it must be saved
             type(self).cells = cells
+            self._sync_pack()
             blob = load_json(self.cells_path)          # keep dir_proto and anything else
             blob.update({"video": self.video.name, "panel": type(self).panel,
                          "panel_size": type(self).panel_size, "cells": cells})
@@ -1050,7 +1079,7 @@ def main() -> int:
     args = ap.parse_args()
     video = Path(args.video).resolve()
     mapping_path = Path(args.mapping).resolve() if args.mapping else \
-        Path("runs") / ("keycast-mapping-%s.json" % video.stem)
+        _vp.meta_path(_vp.stem_of(video))
 
     try:
         from ash.actions.space import BUTTONS as _B
@@ -1059,8 +1088,30 @@ def main() -> int:
         keys = ["up", "down", "left", "right", "jump", "attack", "dash", "special",
                 "interact", "menu", "ult", "weapon_switch", "cancel", "item"]
 
-    cells_path = Path("runs") / ("keycast-cells-%s.json" % video.stem)
-    if cells_path.exists():
+    cells_path = _vp.meta_path(_vp.stem_of(video))
+    # Prefer the unified per-video pack (data/videos/<stem>/meta.json); the legacy pair of
+    # cells/mapping files is the fallback so unmigrated videos keep working.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from ash.data.video_pack import load_meta as _load_meta
+        _meta = _load_meta(_vp.stem_of(video))
+    except Exception:                                 # noqa: BLE001
+        _meta = None
+    if _meta:
+        if _meta.get("panel") and _meta.get("panel_size"):
+            Server.panel = [int(v) for v in _meta["panel"]]
+            Server.panel_size = [int(v) for v in _meta["panel_size"]]
+            print("panel: %s size %s from the video pack" % (Server.panel, Server.panel_size))
+        if _meta.get("cells"):
+            Server.cells = {k: list(v) for k, v in _meta["cells"].items()}
+            print("cells: %d loaded from the video pack" % len(Server.cells))
+        if _meta.get("dir_proto"):
+            Server.dir_proto = {k: list(v) for k, v in _meta["dir_proto"].items()}
+        if _meta.get("mapping"):
+            Server.mapping.update({k: v for k, v in _meta["mapping"].items()})
+        if _meta.get("style"):
+            Server.style = _meta["style"]
+    if cells_path.exists() and not Server.cells:
         try:
             blob = json.loads(cells_path.read_text())
         except Exception as exc:                      # noqa: BLE001

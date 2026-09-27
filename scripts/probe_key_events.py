@@ -27,13 +27,15 @@ from sklearn.linear_model import LogisticRegression
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 STEMS = ["BV13HnzzPEEN", "BV19s4y1y7un"]
 CAP = 2500
 
 
 def features_and_labels(stem: str, size: int = 32, cap: int = CAP):
-    fr = np.load("data/corpus/%s.npy" % stem, mmap_mode="r")
-    L = np.load("runs/keycast-labels-%s.npz" % stem, allow_pickle=True)
+    fr = np.load(artifact(stem, "corpus-4fps"), mmap_mode="r")
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     held, names = L["held"].astype(bool), [str(n) for n in L["names"]]
     n = min(len(fr) - 1, len(held) - 1)
     idx = np.arange(1, n)                      # need t-1 for the event, and t+1 for the diff

@@ -28,9 +28,13 @@ import sys
 from pathlib import Path
 
 import cv2
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import ash.data.video_pack as vp  # noqa: E402
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from ash.data.video_pack import artifact_path as _ap  # noqa: E402
 
 PANEL = (250, 582)
 PANEL_W, PANEL_H = 300, 138
@@ -50,7 +54,7 @@ def main() -> int:
     px, py = (int(v) for v in args.panel.split(","))
     pw, ph = (int(v) for v in args.panel_size.split(","))
     out = Path(args.out) if args.out else \
-        Path("runs") / ("keycast-cells-%s.json" % Path(args.video).stem)
+        vp.meta_path(vp.stem_of(args.video))
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",

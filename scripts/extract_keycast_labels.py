@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from ash.data.video_pack import artifact_path as _ap  # noqa: E402
 
 from ash.actions.space import ActionSpace, BUTTONS  # noqa: E402
 
@@ -66,15 +67,15 @@ def main() -> int:
     args = ap.parse_args()
 
     video = Path(args.video)
-    stem = video.stem
+    stem = stem_of(video)
     # Default to the per-video files the page writes.  Without this the layout is not
     # found at all unless the caller passes the paths, and the next video silently
     # produced "no cells" (the first video worked only because I named them explicitly).
-    cells_blob = load(args.cells or ("runs/keycast-cells-%s.json" % stem),
+    cells_blob = load(args.cells or str(vp.artifact_path(stem, "cells")),
                       {"cells": {}, "dir_proto": {}, "panel": [250, 582]})
     cells = {k: tuple(v) for k, v in cells_blob.get("cells", {}).items()}
     proto = {k: tuple(v) for k, v in cells_blob.get("dir_proto", {}).items()}
-    mapping_blob = load(args.mapping or ("runs/keycast-mapping-%s.json" % stem),
+    mapping_blob = load(args.mapping or str(vp.artifact_path(stem, "mapping")),
                         {"cells": {}})
     mapping = {k: v for k, v in mapping_blob.get("cells", {}).items()
                if v != "(ignore)" and k in cells}
@@ -237,11 +238,11 @@ def main() -> int:
         else:
             masks[k] = idx
 
-    corpus = Path("data/corpus/%s.npy" % stem)
+    corpus = vp.artifact(stem, "corpus-4fps")
     corpus_frames = None
     if corpus.exists():
         corpus_frames = int(np.load(corpus, mmap_mode="r").shape[0])
-    out = Path(args.out) if args.out else Path("runs") / ("keycast-labels-%s.npz" % stem)
+    out = Path(args.out) if args.out else vp.artifact_path(stem, "labels")
     np.savez_compressed(out, times=np.arange(n_ticks) * args.tick, held=held,
                         tapped=tapped, masks=masks, names=np.array(names))
     print("\nwrote %s" % out)

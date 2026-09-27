@@ -27,14 +27,16 @@ from sklearn.linear_model import LogisticRegression
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 KS = [1, 2, 4, 8]          # difference images stacked (K=1 is the single pair used so far)
 RS = [32, 64]              # block size the difference image is reduced to
 CAP = 2000                 # samples per video
 
 
 def features(stem: str, K: int, R: int, cap: int = CAP):
-    fr = np.load("data/corpus/%s.npy" % stem, mmap_mode="r")
-    L = np.load("runs/keycast-labels-%s.npz" % stem, allow_pickle=True)
+    fr = np.load(artifact(stem, "corpus-4fps"), mmap_mode="r")
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     held, names = L["held"].astype(bool), [str(n) for n in L["names"]]
     n = min(len(fr) - 1, len(held) - 1)
     lo = K                                       # K diffs need frames t..t-K, so ticks [K, n)

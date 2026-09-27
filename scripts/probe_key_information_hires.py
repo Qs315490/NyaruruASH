@@ -30,6 +30,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.utils.device import resolve_device  # noqa: E402
 
 STEM = "BV19s4y1y7un"
@@ -89,10 +91,10 @@ def run(tag: str, frames, labels, held, dev, epochs=1, batch=32, lr=3e-4):
 
 def main() -> int:
     dev = resolve_device("cuda")
-    L = np.load("runs/keycast-labels-%s.npz" % STEM, allow_pickle=True)
+    L = np.load(artifact(STEM, "labels"), allow_pickle=True)
     names = [str(x) for x in L["names"]]
     Y = L["held"].astype(np.float32)
-    corpora = [("256x256 corpus", Path("data/corpus/%s.npy" % STEM)),
+    corpora = [("256x256 corpus", artifact(STEM, "corpus-4fps")),
                ("512x288 hires", Path("runs/hires-%s.npy" % STEM))]
     print("%-16s %9s %9s   per-key F1" % ("input", "macroF1", "ON-bit"))
     for tag, path in corpora:

@@ -26,6 +26,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.actions.space import DEFAULT_NUM_ACTIONS  # noqa: E402
 from ash.models.idm import IdmConfig, IdmModel  # noqa: E402
 from ash.utils.device import resolve_device  # noqa: E402
@@ -49,8 +51,8 @@ def main() -> int:
                     help="colour jitter + paired random crop/scale (train only)")
     args = ap.parse_args()
 
-    frames_path = Path(args.frames or ("data/corpus/%s.npy" % args.stem))
-    labels_path = Path(args.labels or ("runs/keycast-labels-%s.npz" % args.stem))
+    frames_path = Path(args.frames) if args.frames else _vp.artifact(args.stem, "corpus-4fps")
+    labels_path = Path(args.labels) if args.labels else _vp.artifact(args.stem, "labels")
     frames = np.load(frames_path, mmap_mode="r")
     labels = np.load(labels_path, allow_pickle=True)
     masks = labels["masks"].astype(np.int64)
@@ -68,8 +70,8 @@ def main() -> int:
         # Cross-video: the test set is a DIFFERENT runner's capture, so this measures
         # whether the labels describe the game rather than the video they came from.
         # Training uses the whole train video (no split) since the separation is the point.
-        t_frames = np.load(Path("data/corpus/%s.npy" % args.test_stem), mmap_mode="r")
-        t_labels = np.load(Path("runs/keycast-labels-%s.npz" % args.test_stem),
+        t_frames = np.load(_vp.artifact(args.test_stem, "corpus-4fps"), mmap_mode="r")
+        t_labels = np.load(artifact(args.test_stem, "labels"),
                            allow_pickle=True)
         t_masks = t_labels["masks"].astype(np.int64)
         tn = min(len(t_frames) - 1, len(t_masks) - 1)
@@ -89,8 +91,8 @@ def main() -> int:
     if args.train_stems:
         multi = []
         for st in [x.strip() for x in args.train_stems.split(",") if x.strip()]:
-            fr = np.load(Path("data/corpus/%s.npy" % st), mmap_mode="r")
-            mk = np.load(Path("runs/keycast-labels-%s.npz" % st),
+            fr = np.load(_vp.artifact(st, "corpus-4fps"), mmap_mode="r")
+            mk = np.load(artifact(st, "labels"),
                          allow_pickle=True)["masks"].astype(np.int64)
             n_i = min(len(fr) - 1, len(mk) - 1)     # NOT `nn`: that shadows torch.nn
             multi.append((st, fr, mk, n_i))

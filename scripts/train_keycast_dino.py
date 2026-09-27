@@ -28,6 +28,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.memory.embeddings import FrameEmbedder  # noqa: E402
 from ash.utils.device import resolve_device  # noqa: E402
 
@@ -35,7 +37,7 @@ from ash.utils.device import resolve_device  # noqa: E402
 def features(stem: str, emb: FrameEmbedder) -> np.ndarray:
     """DINOv2 features for one video's corpus frames, cached on disk."""
     out = Path("runs") / ("dino-%s.npy" % stem)
-    fr = np.load(Path("data/corpus/%s.npy" % stem), mmap_mode="r")
+    fr = np.load(artifact(stem, "corpus-4fps"), mmap_mode="r")
     if out.exists():
         E = np.load(out)
         if len(E) == len(fr):
@@ -52,7 +54,7 @@ def features(stem: str, emb: FrameEmbedder) -> np.ndarray:
 
 
 def held_of(stem: str):
-    L = np.load(Path("runs/keycast-labels-%s.npz" % stem), allow_pickle=True)
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     return L["held"].astype(np.float32), [str(n) for n in L["names"]]
 
 

@@ -32,6 +32,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.utils.device import resolve_device  # noqa: E402
 
 STEM = "BV19s4y1y7un"
@@ -77,7 +79,7 @@ def main() -> int:
     dev = resolve_device("cuda")
     video = Path("data/video-src/%s.mp4" % STEM)
     F = frames_30fps(video)
-    L = np.load("runs/keycast-labels-%s.npz" % STEM, allow_pickle=True)
+    L = np.load(artifact(STEM, "labels"), allow_pickle=True)
     held, names = L["held"].astype(np.float32), [str(n) for n in L["names"]]
     step = FPS * TICK                                  # 7.5 frames per tick
     n_tick = min(len(held), int(len(F) / step) - 1)

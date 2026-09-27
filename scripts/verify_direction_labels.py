@@ -26,6 +26,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact, stem_of  # noqa: E402
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -39,7 +41,7 @@ def main() -> int:
     ap.add_argument("--tick", type=float, default=0.25)
     args = ap.parse_args()
     video = Path(args.video)
-    stem = video.stem
+    stem = stem_of(video)
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -71,7 +73,7 @@ def main() -> int:
     print("%s %dx%d: %d frames at %dfps, region %s -> %dx%d"
           % (stem, vw, vh, n, args.fps, args.region, gx1 - gx0, gy1 - gy0))
 
-    L = np.load(Path("runs/keycast-labels-%s.npz" % stem), allow_pickle=True)
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     held, names = L["held"], [str(x) for x in L["names"]]
     idx = {k: i for i, k in enumerate(names)}
     # frame i (at args.fps) sits at tick round(i / fps / tick)

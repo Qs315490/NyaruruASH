@@ -26,10 +26,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 
 def samples(stem: str):
     E = np.load(Path("runs") / ("dino-%s.npy" % stem))
-    L = np.load(Path("runs/keycast-labels-%s.npz" % stem), allow_pickle=True)
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     held, names = L["held"].astype(bool), [str(n) for n in L["names"]]
     if "left" not in names or "right" not in names:
         return None

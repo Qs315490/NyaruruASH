@@ -27,14 +27,16 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ash.data.video_pack import artifact  # noqa: E402
+
 from ash.models.idm import IdmConfig, IdmModel  # noqa: E402
 from ash.utils.device import resolve_device  # noqa: E402
 
 
 def load(stem: str):
     """(frames mmap, held bits, key names) for one video, aligned by construction."""
-    fr = np.load(Path("data/corpus/%s.npy" % stem), mmap_mode="r")
-    L = np.load(Path("runs/keycast-labels-%s.npz" % stem), allow_pickle=True)
+    fr = np.load(artifact(stem, "corpus-4fps"), mmap_mode="r")
+    L = np.load(artifact(stem, "labels"), allow_pickle=True)
     held = L["held"].astype(np.float32)
     names = [str(n) for n in L["names"]]
     n = min(len(fr) - 1, len(held) - 1)

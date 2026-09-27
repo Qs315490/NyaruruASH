@@ -28,9 +28,13 @@ import sys
 from pathlib import Path
 
 import cv2
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import ash.data.video_pack as vp  # noqa: E402
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from ash.data.video_pack import artifact_path as _ap  # noqa: E402
 
 DIR_NAMES = ["U", "UL", "UR", "L", "-", "R", "DL", "DR", "D"]
 
@@ -159,7 +163,7 @@ def main() -> int:
     rel = {k: [int(v[0]) - x0, int(v[1]) - y0] for k, v in cells.items()}
     proto = {k: [v[0], v[1]] for k, v in rel.items() if k in DIR_NAMES}
     out = Path(args.out) if args.out else \
-        Path("runs") / ("keycast-cells-%s.json" % video.stem)
+        vp.meta_path(vp.stem_of(video))
     out.write_text(json.dumps(
         {"video": video.name, "panel": [x0, y0], "panel_size": [x1 - x0, y1 - y0],
          "cells": rel, "dir_proto": proto}, indent=1, ensure_ascii=False))

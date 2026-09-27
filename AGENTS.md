@@ -262,6 +262,12 @@
 ## 现状（先读 `docs/status.md`）
 
 **速通视频按键标签路线（2026-09-26）已收口，交接文档见 `docs/keycast-handover.md`。**
+**数据布局（2026-09-26 起）**：一支视频一个文件夹 `data/videos/<id>/`（video.mp4 + meta.json +
+labels.npz + 可选帧库），代码入口 `src/ash/data/video_pack.py`（`load_meta`/`artifact`/`migrate`，
+`artifact()` 对未迁移的视频回退到旧路径）。
+`meta.json` 必须含 **`game_area`**（游戏画面矩形，两角点，**必须实测不许猜**）与 `video`（**pack 内真实文件名**）；
+`python -m ash.data.video_pack` 打印各 pack 状态与缺口，`validate_meta()` 校验矩形越界/缺失。
+测试 `tests/test_video_pack.py`（12 项）。
 一句话：标签干净可用（4 支视频、3 支可用、37,903 tick、逐帧对齐、方向经独立信号验证），
 但「从 4 fps 单帧对读出哪个键」的天花板量到 ≈0.19~0.27 macro-F1，**14 种干预都不动**（见该文档第 4 节表格）。
 能稳定读出的只有**方向**（背景滚动，二分类 0.637）。**不要再重复那些已排除的干预**。
