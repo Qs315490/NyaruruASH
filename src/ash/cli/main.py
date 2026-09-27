@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,7 +35,6 @@ def _setup_logging(verbose: int) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    from ash.env.base import make_env
 
     checks: list[tuple[str, str]] = []
     try:
@@ -126,7 +127,12 @@ def _check_corpus_interval(corpus_dir: str | None, expected_fps: float) -> str |
 
 def cmd_run(args: argparse.Namespace) -> int:
     from ash.config import load_game_config
-    from ash.loop.orchestrator import LoopConfig, Orchestrator, load_or_init_idm, load_or_init_policy
+    from ash.loop.orchestrator import (
+        LoopConfig,
+        Orchestrator,
+        load_or_init_idm,
+        load_or_init_policy,
+    )
     from ash.loop.runner import InferenceRunner
     from ash.utils.device import resolve_device
 
@@ -205,7 +211,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # K must exist before the first inference step because runner.run() calls
     # classify() on every 4th frame; the first bootstrap only runs after a whole
     # round of inference has finished, which is too late.
-    index = _corpus_embeddings(args.corpus_index, args.corpus, embedder)
+    index = _corpus_embeddings(args.corpus_index, args.corpus, embedder,
+                               args.recordings)
     kdm = _key_moment_model(args, embedder, index)
 
     def runner(**kw):
@@ -233,13 +240,36 @@ def cmd_run(args: argparse.Namespace) -> int:
             for e in envs:
                 e.close()
 
-    def bootstrap_fn(**kw):  # full bootstrap; corpus loading lives here
-        from ash.loop.bootstrap import Bootstrapper, BootstrapConfig
+    # Loaded once, sampled per round: the recording is 677 MB and reading it
+    # every round would cost more than the training it feeds.
+    replay_demo = None
+    if args.idm_replay:
+        from ash.train.demo_mapping import load_demo
 
-        b = Bootstrapper(BootstrapConfig(image_size=args.image_size, device=device))
+        replay_demo = load_demo(args.idm_replay)
+        log.info("idm replay: %d human frames from %s (%d steps per round)",
+                 len(replay_demo["observations"]), args.idm_replay,
+                 args.idm_replay_steps)
+
+    def bootstrap_fn(**kw):  # full bootstrap; corpus loading lives here
+        from ash.loop.bootstrap import BootstrapConfig, Bootstrapper
+        from ash.train.demo_mapping import sample_replay
+
+        replay = []
+        if replay_demo is not None:
+            # The round index is the seed, so successive rounds replay
+            # different parts of the recording instead of the same slice.
+            replay = sample_replay(replay_demo, action_space,
+                                   steps=args.idm_replay_steps,
+                                   seed=int(kw.get("round_index", 0)))
+            log.info("idm replay: %d transitions from the demonstrations",
+                     sum(len(t["act"]) for t in replay))
+
+        b = Bootstrapper(BootstrapConfig(image_size=args.image_size, device=device,
+                         max_policy_steps=args.policy_steps))
         return b.run(
             kw["policy"], kw["idm"], kw["kdm"], kw["trajectories"],
-            corpus_loader=_corpus_loader(args.corpus),
+            corpus_loader=_corpus_loader(args.corpus, args.recordings),
             out_dir=Path(kw["out_dir"]),
             # D^R from step 2.  Dropping it here made retrieval a no-op: the
             # bootstrap read the whole corpus and reported a plausible
@@ -250,6 +280,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             # The retrieval index already holds every corpus video's DINOv2
             # matrix; without it the bootstrap re-embeds D^R twice per round.
             corpus_embeddings=dict(index),
+            # Keeping the human dynamics in the IDM's training set is what stops
+            # a round of near-duplicate self-play transitions from overwriting
+            # them (measured: val 0.29 -> 3.16 without this).
+            replay_trajectories=replay,
         )
 
     log.info("retrieval index: %d videos", len(index))
@@ -374,7 +408,7 @@ def _kdm_fingerprint(args, kdm: Any, embedder: Any) -> str:
     return json.dumps(
         {
             "v": 1,
-            "corpus": _corpus_fingerprint(args.corpus, embedder.image_size),
+            "corpus": _corpus_fingerprint(args.corpus, embedder.image_size, args.recordings),
             "params": kdm.hyperparameters(),
             "hdbscan": _dist_version("hdbscan"),
             "sklearn": getattr(sklearn, "__version__", _dist_version("scikit-learn")),
@@ -397,6 +431,7 @@ def _corpus_embeddings(
     path: str | None,
     corpus_dir: str | None,
     embedder: Any,
+    recordings_dir: str | None = None,
 ) -> list[tuple[str, np.ndarray]]:
     """One L2-normalized embedding matrix per corpus video.
 
@@ -405,12 +440,12 @@ def _corpus_embeddings(
 
     Building it costs one DINOv2 pass over the corpus, so the result is cached
     in a sibling file.  The cache deliberately does NOT live inside the corpus
-    directory: the loader globs `*.npz` there, so a cache written next to the
+    directory: the loader globs the corpus dir, so a cache written next to the
     videos would be picked up on the next run as a corpus video named "index".
     """
     base = Path(corpus_dir or "data/corpus")
     cache = Path(path) if path else base.parent / (base.name + "-embeddings.npz")
-    stamp = _corpus_fingerprint(corpus_dir, embedder.image_size)
+    stamp = _corpus_fingerprint(corpus_dir, embedder.image_size, recordings_dir)
     if cache.exists():
         with np.load(cache, allow_pickle=False) as data:
             meta = data["__meta__"] if "__meta__" in data.files else None
@@ -423,7 +458,7 @@ def _corpus_embeddings(
             # reusing it.
             log.warning("retrieval index cache %s is stale or unversioned; rebuilding", cache)
     out: list[tuple[str, np.ndarray]] = []
-    for vid, frames in _corpus_loader(corpus_dir)():
+    for vid, frames in _corpus_loader(corpus_dir, recordings_dir)():
         if len(frames):
             out.append((vid, embedder.embed(frames)))
     if out:
@@ -432,20 +467,46 @@ def _corpus_embeddings(
     return out
 
 
-def _corpus_fingerprint(corpus_dir: str | None, image_size: int) -> str:
+def _corpus_dirs(corpus_dir: str | None, recordings_dir: str | None = None) -> list[Path]:
+    """The directories that make up D^I, in precedence order.
+
+    Recorded human sessions count as corpus: K is fit on D^I, and a session of the
+    rooms the scraped videos never visit is what makes K fire where the agent
+    actually is.  Measured before this existed: the agent sat at cosine 0.77-0.92
+    to its nearest corpus frame, no corpus frame came within 0.95 of any live
+    frame, and `key_moments` was 0 in every round.
+    """
+    dirs = [Path(p) for p in (corpus_dir or "data/corpus").split(os.pathsep) if p]
+    for p in (recordings_dir or "").split(os.pathsep):
+        if p and Path(p).is_dir():
+            dirs.append(Path(p))
+    return dirs
+
+
+def _corpus_fingerprint(corpus_dir: str | None, image_size: int,
+                        recordings_dir: str | None = None) -> str:
     """Cheap identity of the corpus + embedding resolution, for the cache.
 
     Uses file names and sizes rather than loading the frames: the point is to
-    notice that the corpus changed, and reading 3 GB of npz to find that out
+    notice that the corpus changed, and reading 3 GB of frames to find that out
     would cost more than the embeddings it guards.
+
+    Both extensions are listed.  When the corpus was packed to memory-mappable
+    `.npy` and the `.npz` originals were deleted, a fingerprint that only globbed
+    `.npz` became empty - so any later change to the corpus would have been
+    silently ignored and a stale index reused, which is the exact failure this
+    function exists to prevent.
     """
-    base = Path(corpus_dir or "data/corpus")
-    files = sorted((p.name, p.stat().st_size) for p in base.glob("*.npz"))
+    files = []
+    for base in _corpus_dirs(corpus_dir, recordings_dir):
+        for path in sorted(base.glob("*.npz")) + sorted(base.glob("*.npy")):
+            files.append((str(path), path.stat().st_size))
+    files.sort()
     return json.dumps({"v": 1, "image_size": int(image_size), "files": files},
                       sort_keys=True)
 
 
-def _corpus_loader(corpus_dir: str | None):
+def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None):
     """Yield (video_id, frames) for the corpus, optionally restricted to D^R.
 
     `ids=None` means the whole corpus D^I (used to fit K and to build the
@@ -453,15 +514,233 @@ def _corpus_loader(corpus_dir: str | None):
     the *retrieved* subset, so the bootstrap passes the ids step 2 selected.
     Reading the whole corpus regardless made retrieval a no-op.
     """
+    #: Directories searched for observation-only trajectories.  Recorded human
+    #: sessions belong here as much as the videos do: K is fit on D^I, and a
+    #: session of the rooms the corpus never visits is what makes K fire where the
+    #: agent actually is.  Measured before this: the agent sat at cosine 0.77-0.92
+    #: to the nearest corpus frame, no corpus frame was within 0.95 of any live
+    #: frame, and `key_moments` was 0 in every single round.
+    bases = _corpus_dirs(corpus_dir, recordings_dir)
+
     def load(ids: list[str] | None = None):
-        base = Path(corpus_dir or "data/corpus")
         want = None if ids is None else set(ids)
-        for npz in sorted(base.glob("*.npz")):
-            if want is not None and npz.stem not in want:
+        # One stem per file, first directory wins, so a recording deliberately
+        # placed in the corpus dir is not shadowed by an empty namesake.
+        found: dict[str, Path] = {}
+        for base in bases:
+            if not base.exists():
                 continue
-            data = np.load(npz)
-            yield npz.stem, data["frames"]
+            for path in sorted(base.glob("*.npz")) + sorted(base.glob("*.npy")):
+                found.setdefault(path.stem, base)
+        for stem, base in sorted(found.items()):
+            if want is not None and stem not in want:
+                continue
+            # Prefer the uncompressed form: memory-mapped frames are clean page
+            # cache the kernel can evict, while an npz member is anonymous memory
+            # it cannot, and materializing 2.6 GB of it stalled a round in swap.
+            packed = base / f"{stem}.npy"
+            if packed.exists():
+                yield stem, np.load(packed, mmap_mode="r")
+                continue
+            with np.load(base / f"{stem}.npz") as data:
+                # `frames` is a scraped video, `observations` a recorded session;
+                # both are D^I, they only spell the array differently.
+                key = "frames"
+                if key not in data.files:
+                    key = "observations"
+                yield stem, data[key]
     return load
+
+
+class _StopFlag:
+    """Set by SIGTERM/SIGINT so the recording is saved instead of discarded.
+
+    A backgrounded recorder cannot be Ctrl-C'd by the person playing, and the
+    default SIGTERM action kills the process before `save()` runs - the whole
+    session is lost.  Both signals now mean "finish this frame, write the file".
+    """
+
+    def __init__(self) -> None:
+        self.stop = False
+        self._previous: dict[int, Any] = {}
+
+    def install(self) -> None:
+        import signal
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self._previous[sig] = signal.signal(sig, self._handle)
+
+    def _handle(self, signum, _frame) -> None:
+        self.stop = True
+        log.warning("signal %d: finishing this frame and saving the recording", signum)
+
+    def requested(self) -> bool:
+        return self.stop
+
+    def restore(self) -> None:
+        import signal
+
+        for sig, handler in self._previous.items():
+            signal.signal(sig, handler)
+        self._previous.clear()
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    """Record a human playing, without ever dispatching a key.
+
+    This is the data source the IDM actually needs.  Fitting it on the agent's
+    own transitions collapsed it to the class prior (val 4.64 against ln(20)=3.00
+    from 220 near-duplicate samples); the 24447 frames in `data/idm-human/` are
+    what made it work (val 0.29), and this is how more of that gets made.
+    """
+    import time
+
+    from ash.data.recorder import HumanSessionConfig, HumanSessionRecorder
+    from ash.env.cdp_backend import CdpSpeedrunEnv
+    from ash.train.demo_mapping import LEGACY_CONTROLS, LEGACY_KEY_CODES
+
+    env = CdpSpeedrunEnv(drive="realtime", resize=(args.size, args.size))
+    env.connect(target_index=args.target)
+    env.install(seed=args.seed)
+    safety = env.safety()
+    log.info("scene %s, in gameplay: %s", safety.get("scene"), safety.get("inGameplay"))
+    if not safety.get("inGameplay"):
+        log.warning("not in Scene_Map: the recording will contain whatever is on screen")
+
+    stop = _StopFlag()
+    out = Path(args.out)
+    # Samples are spilled here as they arrive.  A background job is killed hard -
+    # measured: a 16-minute recording, one file written at the end, nothing left on
+    # disk - so the session must not live only in RAM until save().
+    session_dir = out.parent / (out.name + ".session")
+    cfg = HumanSessionConfig(out=out, fps=args.fps, size=args.size,
+                             episode=args.episode, session_dir=session_dir)
+    rec = HumanSessionRecorder(env, cfg, LEGACY_CONTROLS, LEGACY_KEY_CODES)
+    stop.install()
+    rec.install()
+    interval = 1.0 / max(args.fps, 1e-6)
+    log.info("recording %s at %.1f fps (%d x %d). Play the game now; "
+             "Ctrl-C stops and saves.", cfg.out, cfg.fps, cfg.size, cfg.size)
+    last = [0.0]
+
+    def tick(n: int, mask: int, frame) -> None:
+        now = time.time()
+        if now - last[0] >= 5.0:
+            last[0] = now
+            log.info("recorded %d frames (%.0f s of play)", n, n * interval)
+
+    try:
+        frames = rec.run(minutes=args.minutes, on_tick=tick, should_stop=stop.requested)
+    finally:
+        stop.restore()
+        # The player is driving; hand the game back running, unlike the
+        # self-play path, which deliberately leaves it paused.
+        env.close(resume=True)
+
+    if frames == 0:
+        log.error("nothing recorded")
+        return 5
+    path = rec.save()
+    # The npz is the product; the spill is only there so a kill is survivable.
+    # Removed only after the archive is on disk and readable.
+    try:
+        with np.load(path, allow_pickle=True) as check:
+            if len(check["control_masks"]) != frames:
+                raise ValueError("archive holds %d of %d frames"
+                                 % (len(check["control_masks"]), frames))
+        shutil.rmtree(session_dir)
+    except Exception as exc:       # noqa: BLE001 - never delete data on doubt
+        log.warning("kept the spill directory %s (%s)", session_dir, exc)
+    masks = np.asarray(rec.masks, dtype=np.int64)
+    pressed = int((masks != 0).sum())
+    per_key = {
+        name: int(sum(1 for m in rec.masks if m & (1 << bit)))
+        for bit, name in enumerate(LEGACY_CONTROLS)
+    }
+    log.info("saved %s: %d frames, %.1f s, %d frames with a key down (%.1f%%)",
+             path, frames, frames * interval, pressed, 100.0 * pressed / frames)
+    log.info("per-key frame counts: %s", {k: v for k, v in per_key.items() if v})
+    log.info("screenshot straddled a key change in %d frames (%.1f%%)",
+             rec.alignment_errors, 100.0 * rec.alignment_errors / frames)
+    if pressed == 0:
+        log.warning("no key was recorded at all - check that the game window had focus")
+    log.info("next: uv run python scripts/pack_demos.py %s", path)
+    log.info("then: ash pretrain-idm --demos %s --out models/idm-<name>.pt", path)
+    return 0
+
+
+def cmd_assemble(args: argparse.Namespace) -> int:
+    """Recover a spilled recording, e.g. after the process was killed hard."""
+    from ash.data.recorder import assemble_session
+
+    path = assemble_session(args.session_dir, args.out)
+    with np.load(path, allow_pickle=True) as data:
+        n = len(data["control_masks"])
+        pressed = int((data["control_masks"] != 0).sum())
+    log.info("assembled %d frames (%d with a key down) -> %s", n, pressed, path)
+    return 0
+
+
+def cmd_pretrain_idm(args: argparse.Namespace) -> int:
+    """Supervised IDM pretraining on the recorded human demonstrations.
+
+    The ASH bootstrap trains the IDM on the agent's own transitions, and from a
+    standing start those transitions are near-duplicates in one small room: the
+    value sat at ln(num_classes) - the "predict the prior" solution - for both
+    220 and 1060 transitions, and every corpus video came back ~100% one class,
+    so pi was never updated at all.
+
+    `vpt-amd-package/data/idm-human.npz` holds 24447 frames of human play with a
+    control mask per frame.  That is real (obs[t], obs[t+1], action) data, so the
+    IDM can be fitted supervised instead of guessed, which is the only way the
+    pseudo-labels stop being a constant.  The masks are translated by
+    train/demo_mapping.py (99.1% land exactly on this project's action space).
+    """
+    from ash.actions.space import ActionSpace
+    from ash.loop.bootstrap import BootstrapConfig, Bootstrapper
+    from ash.models.idm import IdmConfig, IdmModel, save_idm
+    from ash.train.demo_mapping import map_legacy_masks
+
+    space = ActionSpace.minimal()
+    with np.load(args.demos, allow_pickle=False) as data:
+        obs = data["observations"]
+        masks = data["control_masks"]
+        episodes = data["episode_ids"]
+    image_size = int(obs.shape[1])
+    index, mapping = map_legacy_masks(masks, space)
+    log.info("demo mapping: %d frames, %d distinct masks, %d exact, %d snapped, "
+             "%d frames whose only presses were dropped keys",
+             mapping["frames"], mapping["distinct_legacy_masks"], mapping["exact"],
+             mapping["snapped"], mapping["frames_whose_only_presses_were_dropped_keys"])
+    if mapping["exact"] < 0.9 * mapping["frames"]:
+        log.warning("under 90%% of demo frames map exactly onto the action space")
+
+    trajectories = []
+    for episode in np.unique(episodes):
+        take = episodes == episode
+        frames = obs[take]
+        if len(frames) < 3:
+            continue
+        # The recorded mask is the key state *after* the frame was drawn, which
+        # is the convention the legacy IDM trainer was written against, so the
+        # label for the pair (t, t+1) is the mask recorded at t+1.
+        actions = index[take][1:].astype(np.int64)
+        trajectories.append({"obs": frames, "act": actions})
+    log.info("demo trajectories: %d episodes, %d transitions",
+             len(trajectories), sum(len(t["act"]) for t in trajectories))
+
+    idm = IdmModel(IdmConfig(image_size=image_size, num_actions=len(space)))
+    bootstrapper = Bootstrapper(BootstrapConfig(
+        image_size=image_size, device=args.device, idm_epochs=args.epochs,
+        batch_size=args.batch_size, lr=args.lr,
+    ))
+    report = bootstrapper.update_idm_from_trajectories(idm, trajectories)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    save_idm(idm, out)
+    log.info("pretrained IDM -> %s (%s)", out, report)
+    log.info("use it with: ash run --idm %s ...", out)
+    return 0
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
@@ -483,7 +762,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--backend", default="fake", choices=["fake", "cdp"])
     r.add_argument("--policy", default=None, help="existing policy checkpoint")
     r.add_argument("--idm", default=None, help="existing IDM checkpoint")
+    r.add_argument("--idm-replay", default=None,
+                   help="recorded human demonstrations to replay into every IDM update")
+    r.add_argument("--policy-steps", type=int, default=300,
+                   help="cap on pi optimizer steps per round (0 = unbounded)")
+    r.add_argument("--idm-replay-steps", type=int, default=4000,
+                   help="demonstration transitions replayed per round")
     r.add_argument("--corpus", default="data/corpus", help="internet video corpus dir")
+    r.add_argument("--recordings", default="data/recordings",
+                   help="dir of recorded human sessions to add to D^I (K coverage)")
     r.add_argument("--corpus-index", default=None, help="precomputed embedding index json")
     r.add_argument("--kdm-cache", default=None,
                    help="fitted key-moment model cache (default: beside the corpus)")
@@ -503,6 +790,33 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--random-steps", type=int, default=100)
     r.add_argument("--out", default="runs/ash")
     r.set_defaults(fn=cmd_run)
+
+    asm = sub.add_parser("assemble", help="recover a spilled recording into an npz")
+    asm.add_argument("session_dir", help="the .session directory written by `ash record`")
+    asm.add_argument("--out", required=True)
+    asm.set_defaults(fn=cmd_assemble)
+
+    rc = sub.add_parser("record", help="record a human playing, without sending input")
+    rc.add_argument("--out", default="data/human-001.npz")
+    rc.add_argument("--fps", type=float, default=10.0)
+    rc.add_argument("--size", type=int, default=128)
+    rc.add_argument("--minutes", type=float, default=0.0,
+                    help="stop after this long (0 = until Ctrl-C)")
+    rc.add_argument("--episode", type=int, default=0)
+    rc.add_argument("--seed", type=int, default=None)
+    rc.add_argument("--target", type=int, default=0)
+    rc.set_defaults(fn=cmd_record)
+
+    b = sub.add_parser("pretrain-idm",
+                       help="supervised IDM pretraining on recorded human demos")
+    b.add_argument("--demos", default="data/idm-human.npz",
+                   help="recorded demonstrations with control masks")
+    b.add_argument("--out", default="models/idm-demo.pt")
+    b.add_argument("--epochs", type=int, default=6)
+    b.add_argument("--batch-size", type=int, default=64)
+    b.add_argument("--lr", type=float, default=3e-4)
+    b.add_argument("--device", default=None)
+    b.set_defaults(fn=cmd_pretrain_idm)
 
     e = sub.add_parser("eval", help="print a loop/eval report")
     e.add_argument("report")

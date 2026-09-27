@@ -17,6 +17,7 @@ Order matters and follows the paper exactly:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,9 +27,9 @@ import torch
 from torch import nn
 
 from ash.memory.kdm import KeyMomentModel
-from ash.utils.device import resolve_device
 from ash.models.ash_policy import AshPolicy, save_policy
 from ash.models.idm import IdmModel, save_idm
+from ash.utils.device import resolve_device
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,12 @@ class BootstrapConfig:
     idm_epochs: int = 3
     policy_epochs: int = 3
     batch_size: int = 8
+    # Upper bound on pi's optimizer steps per round, across epochs.  The paper
+    # trains pi to convergence on D^R; at w_s=64 with one window per frame that is
+    # ~1000 steps of 512 frame encodings for a single 9405-frame video, so a
+    # four-video round ran for the better part of an hour and logged nothing until
+    # an epoch ended.  Bounded so a round is iterable; 0 removes the cap.
+    max_policy_steps: int = 300
     lr: float = 3e-5
     #: None/"auto" picks cuda when available; see ash.utils.device.
     device: str | None = None
@@ -189,12 +196,22 @@ class WindowDataset:
         )
 
     def batch(self, idx: np.ndarray) -> dict[str, np.ndarray]:
-        """Windows at `idx`, as (B, w_s, H, W, 3) / (B, w_s, A) / (B, w_l, H, W, 3)."""
+        """Windows at `idx`, as (B, w_s, H, W, 3) / (B, w_s, A) / (B, w_l, H, W, 3).
+
+        The windows in one batch are near-neighbours, so they share almost all of
+        their frames.  Reading the covering span once and indexing into it locally
+        turns B scattered row gathers into one contiguous read; the returned
+        arrays are what they always were.
+        """
         i = np.asarray(idx, dtype=np.int64)
         win = i[:, None] + np.arange(self.w_s)[None, :]
+        lo = int(win.min())
+        hi = int(win.max()) + 1
+        local = win - lo
+        frames = self.frames[lo:hi]
         return {
-            "frames": self.frames[win].astype(np.float32) / 255.0,
-            "actions": self.masks[win],
+            "frames": frames[local].astype(np.float32) / 255.0,
+            "actions": self.masks[local],
             "memories": self._memories(i),
         }
 
@@ -395,10 +412,16 @@ class Bootstrapper:
                     torch.from_numpy(b["memories"]).to(dev))
 
         best_val = float("inf")
+        steps = 0
         for epoch in range(cfg.policy_epochs):
             rng.shuffle(train_idx)
             totals = []
+            started = time.time()
+            capped = False
             for i in range(0, len(train_idx), cfg.batch_size):
+                if cfg.max_policy_steps and steps >= cfg.max_policy_steps:
+                    capped = True
+                    break
                 f, a, m = to_tensors(train_idx[i : i + cfg.batch_size])
                 logits = policy(f, a, m)
                 # logits are (B, ws, num_actions); the target for every window
@@ -413,6 +436,8 @@ class Bootstrapper:
                 nn.utils.clip_grad_norm_(policy.parameters(), cfg.grad_clip)
                 opt.step()
                 totals.append(loss.item())
+                steps += 1
+            elapsed = time.time() - started
             with torch.inference_mode():
                 v = []
                 for i in range(0, len(val_idx), cfg.batch_size):
@@ -425,10 +450,20 @@ class Bootstrapper:
                         ).item()
                     )
                 val = float(np.mean(v)) if v else float("inf")
-            log.info("policy epoch %d: train %.4f val %.4f", epoch, np.mean(totals), val)
+            # Logged with a step count and a rate: without them a round sat in
+            # this loop for minutes looking hung.
+            log.info("policy epoch %d: %d steps train %.4f val %.4f (%.1f steps/s)%s",
+                     epoch, len(totals), np.mean(totals) if totals else float("nan"),
+                     val, len(totals) / max(elapsed, 1e-6),
+                     " [capped]" if capped else "")
             best_val = min(best_val, val)
+            if capped:
+                break
         policy.eval()
-        return {"policy_val": best_val}
+        # `policy_steps` is reported because a bounded round and an unbounded one
+        # look identical in the numbers otherwise, and the cap is what keeps a
+        # round iterable (3126 unbounded steps took the better part of an hour).
+        return {"policy_val": best_val, "policy_steps": steps}
 
     # ------------------------------------------------------------------
 
@@ -443,6 +478,7 @@ class Bootstrapper:
         retrieved_ids: list[str] | None = None,
         random_trajectories: list[np.ndarray] | None = None,
         corpus_embeddings: dict[str, np.ndarray] | None = None,
+        replay_trajectories: list[np.ndarray] | None = None,
     ) -> dict:
         """Full bootstrap: refit K on retrieved corpus, update IDM on agent
         trajectories, update pi on IDM-labelled corpus videos.
@@ -457,6 +493,14 @@ class Bootstrapper:
         already has it (the retrieval index does).  Both corpus passes below
         otherwise re-embed every video - twice per round - to recompute vectors
         that are already in memory.
+
+        `replay_trajectories` are action-labelled transitions from the recorded
+        human demonstrations, mixed into the IDM's training set every round.
+        Without them the IDM is fitted on the agent's own transitions alone, and
+        those are near-duplicates inside one small room: a demonstration-
+        pretrained IDM (val 0.29 against ln(20)=3.00) was measured to be driven
+        back to val 3.16 - the class prior - by three epochs on 220 of them, which
+        is why every round's pseudo-labels came back ~100% one class.
         """
         out_dir.mkdir(parents=True, exist_ok=True)
         if retrieved_ids is not None and not retrieved_ids:
@@ -488,7 +532,14 @@ class Bootstrapper:
         # Without the supplement the IDM only ever sees the narrow, biased slice
         # of dynamics the current policy produces, and answers corpus frames
         # with one constant class instead of a distribution.
-        idm_data = list(trajectories) + list(random_trajectories or [])
+        # `replay_trajectories` are action-labelled transitions from the recorded
+        # human demonstrations.  They are not a nicety: measured, one epoch on the
+        # agent's own 220 transitions alone scores 4.64 (worse than predicting the
+        # uniform prior), while mixing in a 3978-transition demonstration sample
+        # holds it at 0.24.  Without them every round re-teaches the class prior
+        # and the pseudo-labels come back ~100% one class.
+        idm_data = (list(trajectories) + list(random_trajectories or [])
+                    + list(replay_trajectories or []))
         n_frames = sum(len(t["obs"]) for t in idm_data)
         idm_report = {"idm_skipped": True}
         if n_frames > 2:
@@ -499,18 +550,35 @@ class Bootstrapper:
             idm_report["random_transitions"] = sum(
                 max(0, len(t["obs"]) - 1) for t in (random_trajectories or [])
             )
+            # Reported so a round says whether the human demonstrations were
+            # actually in the IDM's training set: without them a round of
+            # near-duplicate transitions overwrites the pretrained dynamics.
+            idm_report["replay_transitions"] = sum(
+                max(0, len(t["obs"]) - 1) for t in (replay_trajectories or [])
+            )
         # 3. pi on D^R with pseudo-actions, but only where those labels carry
         # signal.  A constant target trains a constant policy and reports a
         # near-zero loss, so the degeneracy is checked before the update rather
         # than discovered later as "the agent does nothing".
         policy_reports = []
         label_stats: list[dict] = []
-        for vid, obs in corpus_loader(ids=retrieved_ids):
+        # Iterated lazily.  Materializing the loader first - `list(...)` - holds
+        # every corpus video at its capture resolution at once (2.4 GB each) and
+        # that alone was enough for the kernel to run the machine out of memory
+        # and stall the round in swap.
+        total = len(retrieved_ids) if retrieved_ids else "?"
+        for n, (vid, obs) in enumerate(corpus_loader(ids=retrieved_ids), start=1):
+            # Logged because this loop was silently able to stall for minutes,
+            # and nothing in the log said which video it was on.
+            log.info("policy dataset %d/%s: %s (%d frames)", n, total, vid, len(obs))
+            started = time.time()
             try:
                 ds = self.build_policy_dataset(obs, idm, kdm, embed_of(vid, obs))
             except ValueError as e:
                 log.warning("skip corpus video %s: %s", vid, e)
                 continue
+            log.info("policy dataset %d/%s: %s built in %.1fs (%d windows)",
+                     n, total, vid, time.time() - started, len(ds))
             stats = pseudo_label_stats(ds, idm.config.num_actions)
             stats["video"] = vid
             stats.update(logit_diagnosis(ds.logits))
@@ -552,6 +620,11 @@ class Bootstrapper:
             act = np.asarray(t["act"], dtype=np.int64)
             if len(obs) < 2:
                 continue
+            # Resize per trajectory, before concatenating.  The agent's frames
+            # arrive at the environment's capture size (256x256) while the
+            # recorded demonstrations are stored at 128x128, and concatenating
+            # first means the IDM never gets to train on either mix.
+            obs = _prep_uint8(obs, self.config.image_size)
             before_parts.append(obs[:-1])
             after_parts.append(obs[1:])
             act_parts.append(act)

@@ -217,6 +217,31 @@ uv sync
   `currentTime > lastTime` 不成立 → **首泵帧被整个吞掉**（`deltaTime=0`、listener 不触发）
   且 `lastTime` 被重设到合成时间轴上。钉死：首帧 delta 恰好等于 dt、纯泵时钟不脱离真实
   时间轴、`resume()` 之后引擎的下一帧是正常帧（不是 40 秒跳变）。
+- `tests/test_corpus_loader.py`：D^I 由 `--corpus` 与 `--recordings` 两个目录构成，
+  且**录制文件也算语料**（K 在 D^I 上拟合，而抓来的语料是速通录像，不覆盖初始小屋/NPC 房间；
+  实测 `key_moments` 每轮都是 0）。钉死：`observations` 与 `frames` 两种字段名都能读、
+  目录缺失就跳过、`.npy` 优先 mmap、且**缓存指纹必须同时覆盖 `.npy` 与录制目录**——
+  反例（实测）：语料打包成 `.npy` 并删掉原 `.npz` 后，只 glob `*.npz` 的指纹变成空，
+  之后语料再怎么改都会被静默忽略、复用一份过期索引。
+- `tests/test_record.py`：`ash record` 录出来的文件必须能被 `pretrain-idm`/`--idm-replay`
+  直接读（这是录制器的**全部意义**：IDM 只用自博弈转移会塌回类别先验 val 4.64，
+  靠 24447 帧人类数据才降到 0.29）。
+  钉死：npz 往返后 `control_names` 仍是 17 物理键、掩码逐位不变、映射能解出来；
+  **录制器绝不派发按键**（假 conn 会对任何 `Input.*`/`dispatchKeyEvent` 直接失败——
+  派发的键会被记成「人类的选择」，正是要学的东西被污染）；键码位序与
+  `LEGACY_CONTROLS` 同序；**静止画面上的按键只降权不删除**；
+  「截图期间按键变化」的帧数必须被计数而不是隐去。
+  另外用 node 加载真实的 `KEY_TRACKER_JS` 并驱动 keydown/keyup/blur，
+  钉死掩码位序（Z=bit4、up=bit0、blur 清空）。
+  **录制必须边录边落盘**（`session_dir` 溢出目录 + `flush_every`）：反例（实测）——
+  第一版把所有帧留在内存、结束时只写一次文件，而后台作业**是被硬杀的**（harness 没把
+  SIGTERM 送到 Python 进程，日志里既没有 `signal` 也没有 `saved`），于是**9713 帧
+  （16 分钟）的操作一无所有**。现在每 `flush_every` 帧 `flush+fsync` 一次，
+  硬杀最多丢那么多帧；`ash assemble <session_dir> --out <npz>` 可抢救一个进程已死的
+  会话（真机验证：硬杀后仍恢复出 150 帧）。溢出目录非空时**拒绝开始**（两段会话绝不许
+  拼成一条掩码流）。另一个被抓到的真 bug：帧上限与 `run()` 返回值原先读 `len(self.frames)`，
+  而溢出模式下帧不留内存，于是上限永不触发、CLI 会报「什么都没录到」——现在用独立的
+  `self.samples` 计数。
 - `tests/test_report_incremental.py`：每轮必须在 bootstrap **开始前**就落盘。反例（实测）：
   报告只在 `run()` 返回后写一次，于是死在 bootstrap 里的 run 把整轮推理数据抹掉了——
   连「这轮看到过没有关键时刻」都无从得知。

@@ -89,6 +89,8 @@ AGENTS.md     项目工作文档入口
 | 28 层 causal transformer | 6 层、hidden 256 | 同上，规模缩小见 `docs/ai-architecture.md` |
 | N 个并行 agent | 默认 1（可 `--num-agents` 调） | 单游戏进程、单 GPU |
 | DINOv2 ViT-S/14 | 相同 | 无偏差 |
+| IDM 只由 agent 自己的转移更新（Alg 4） | 每轮再混入一批**录制的人类示范**转移（`--idm-replay`） | 实测：只用自己的转移时，一轮 220 条近似重复样本把预训练 IDM 从 `val 0.29` 打回 **`val 4.64`**（比均匀先验还差），伪标签 99.9–100% 单一类、π 从不更新；混入示范后同一轮 `val 0.28` |
+| π 在 D^R 上训到收敛 | 每轮每视频上限 `--policy-steps`（默认 300） | 无上限时一个 9405 帧视频 = 3126 步、每步 8×64 帧编码，实测 **1.0 steps/s** → 近一小时，且 epoch 结束前没有任何日志。上界让一轮可迭代；实际步数写进报告的 `policy_steps` |
 
 ## 复现步骤
 
@@ -100,6 +102,36 @@ AGENTS.md     项目工作文档入口
    菜单选项；输入只允许在 `Scene_Map` 内派发，CLI 启动时会先查一次场景，不在游戏内
    直接拒绝启动（退出码 3）。**不要在标题画面或菜单里启动实机循环**——首次实机自举
    就是这样进入了玩家的存档。
+4. **自己录一段人类操作**（可选，但这是让 IDM 变好的数据来源）：
+   ```bash
+   .venv/bin/ash record --out data/human-001.npz --fps 10 --size 128
+   ```
+   先在游戏里读档进到可操作状态，然后**开着终端直接玩**，玩完按 Ctrl-C。
+   录制的按键状态是**在页面里读玩家自己的物理按键**（`keydown`/`keyup` 的 keyCode），
+   与截图取自同一个事件循环，因此天然对齐——不需要旧项目那套 evdev + 录屏 + 时钟标定。
+   一个键按在**静止画面**上会被降权（`weights`）而不是删除：运动分布是连续的，
+   任何阈值都是任意切断，旧数据集也是这么处理的。结束后会打印帧数、按键直方图、
+   以及「截图期间按键发生变化」的帧数（对齐误差），不会把这些藏起来。
+5. **用带动作标签的示范预训练 IDM**（这一步是 π 能否被训练的前提）：
+   ```bash
+   uv run python scripts/pack_demos.py data/idm-human.npz   # npz → 可 mmap 的 .npy
+   .venv/bin/ash pretrain-idm --demos data/idm-human.npz --out models/idm-demo.pt
+   .venv/bin/ash run --backend cdp --corpus data/corpus \
+       --idm models/idm-demo.pt --idm-replay data/idm-human.npz --policy-steps 200
+   ```
+   没有 `--idm-replay`，每轮自博弈的近似重复转移会把 IDM 打回「预测类别先验」，
+   伪标签退化成常数，π 永远不会更新（见上表）。实测带 replay 的一轮：
+   `majority_share` 0.72–0.87（原先 0.999–1.000）、`classes_used` 7–10（原先 1–3）、
+   `logit_temporal_std` 4.4–5.1（原先 0.09–0.12），4 个视频里 3 个通过守卫并真的更新了 π。
+   自己录的文件同样走这两步（`pack_demos.py` → `pretrain-idm` / `--idm-replay`）。
+
+6. **让录制也参与 K 的覆盖**：把录制文件（或它的 `pack_demos` 产物）放进
+   `data/recordings/`，它会和 `data/corpus/` 一起构成 D^I（`--recordings` 可改路径）。
+   K 是在 D^I 上拟合的，而抓来的语料是**速通录像**——没人会拍初始小屋或某个 NPC 房间。
+   实测：`key_moments` 在每一轮都是 0，实机帧到最近语料帧的余弦只有 0.77–0.92，
+   语料里**没有任何一帧**与实机帧相似度超过 0.95。录一段你实际待的房间，K 才能在那里响；
+   K 一响，卡死计时器不再累积，回合长度会从 `delta + random_steps` 变成几千步。
+   录制文件按 `frames` 或 `observations` 任一字段时间读入，两种写法都接受。
 4. 每轮 `runs/ash/bootstrap-NNN/` 下的 `policy.pt` 即当前策略，
    随时可用 `ash eval runs/ash/loop-report.json` 查看进度。
 

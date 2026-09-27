@@ -162,6 +162,9 @@ class Orchestrator:
                 trajectories=trajectories,
                 random_trajectories=random_trajectories,
                 retrieved_ids=d_r,
+                # Seeds the demonstration replay sample: a different slice each
+                # round, so the whole recording is eventually replayed.
+                round_index=self.bootstrap_round,
                 out_dir=self.config.out_dir / f"bootstrap-{self.bootstrap_round:03d}",
             ))
             entry.pop("bootstrap_pending", None)
