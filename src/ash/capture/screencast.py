@@ -29,6 +29,15 @@ class CdpError(RuntimeError):
     """Any failure talking to, or understood only partially by, the debugger."""
 
 
+class UnsafeSceneError(CdpError):
+    """Refused to dispatch input because the game is not in Scene_Map.
+
+    A separate type, not a message convention: callers must be able to tell
+    "the game is on a menu and I declined to press keys" apart from "the CDP
+    connection broke", because only the first means the safety system worked.
+    """
+
+
 @dataclass
 class Target:
     id: str

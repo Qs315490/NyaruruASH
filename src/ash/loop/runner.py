@@ -8,6 +8,16 @@ Each agent keeps:
 
 The loop halts when any timer reaches delta; the caller then collects the
 trajectories and memory banks for retrieval and bootstrapping.
+
+Action plumbing (three distinct representations, do not conflate them):
+
+    policy class index   what the head emits (0 .. len(action_space)-1)
+    button mask          what env.step() consumes (a packed int)
+    button vector        what the IDM predicts (multi-hot over BUTTONS)
+
+`action_space.mask_at(index)` is the only sanctioned index -> mask conversion;
+an earlier version passed the raw index to step(), which silently pressed an
+unrelated button because the index is not the mask.
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from ash.actions.space import ActionSpace
 from ash.models.ash_policy import AshPolicy
 from ash.memory.kdm import KeyMomentModel
 
@@ -34,6 +45,11 @@ class AgentState:
     short_act: list[int] = field(default_factory=list)
     memory: list[np.ndarray] = field(default_factory=list)   # key-moment obs
     trajectory: list[np.ndarray] = field(default_factory=list)  # all obs
+    #: Button masks actually executed, parallel to trajectory[1:].  The IDM is
+    #: retrained on the agents' own transitions with these as ground-truth
+    #: labels (paper Algorithm 4 step 2), so they are recorded, not
+    #: reconstructed from the policy indices afterwards.
+    actions: list[int] = field(default_factory=list)
     stuck_timer: int = 0
     steps: int = 0
     #: cluster ids matched earlier in this trajectory; K must only fire once
@@ -49,27 +65,69 @@ class InferenceRunner:
         policy: AshPolicy,
         kdm: KeyMomentModel,
         *,
+        action_space: ActionSpace,
         w_s: int = 32,
         w_l: int = 8,
         image_size: int = 128,
         device: str = "cpu",
         max_steps: int = 20_000,
         key_moment_cooldown: int = 30,
+        frame_skip: int = 1,
+        max_confirm_presses: int = 3,
     ) -> None:
+        #: Upper bound on ok presses spent clearing an input-gated scene.  Bounded
+        #: because a screen that does not clear after a couple of oks is not a
+        #: transition screen, and pressing on would be exactly the "press and
+        #: hope" behaviour the gate exists to prevent.
+        self.max_confirm_presses = max(0, int(max_confirm_presses))
         self.env_factory = env_factory
         self.policy = policy.to(device).eval()
         self.kdm = kdm
+        self.action_space = action_space
         self.w_s = w_s
         self.w_l = w_l
         self.image_size = image_size
         self.device = torch.device(device)
         self.max_steps = max_steps
+        #: Game frames one action advances.  This is the agent's timestep and it
+        #: must equal the corpus sampling interval, because the IDM is trained
+        #: on agent pairs and applied to corpus pairs.  It used to be 1 frame
+        #: (1/60 s) against a 2 s corpus: a 120x mismatch that made the IDM
+        #: label 99.8% of corpus frames with one constant class.
+        self.frame_skip = max(1, int(frame_skip))
         # Debounce: the same visual event persists for many consecutive frames
         # (a cutscene, a menu, a room interior).  Without a cooldown every such
         # frame re-classifies as "new" and the stuck timer never advances.
         self.key_moment_cooldown = key_moment_cooldown
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scene_gate(envs: list[Any]) -> tuple[str, str | None]:
+        """Classify the current scene: "ok", "confirm" or "abort".
+
+        Backends that do not implement the hook (the fake one) are always "ok".
+        The CDP backend implements it and fails closed on an unreadable scene,
+        because "I could not tell" must not mean "go ahead and press jump".
+
+        "confirm" is a small allow-list of input-gated screens (the game's own
+        transition scene) where one ok press is required and commits nothing.
+        Refusing input there does not protect anything - it parked a live game
+        in that scene permanently.  Everything else that is not Scene_Map
+        aborts, because pressing keys there commits menu selections.
+        """
+        for env in envs:
+            check = getattr(env, "unsafe_reason", None)
+            if check is None:
+                continue
+            reason = check()
+            if not reason:
+                continue
+            probe = getattr(env, "is_confirm_scene", None)
+            if probe is not None and probe():
+                return "confirm", reason
+            return "abort", reason
+        return "ok", None
 
     @staticmethod
     def _frame(result: Any) -> np.ndarray:
@@ -88,13 +146,14 @@ class InferenceRunner:
         return f.astype(np.float32) / 255.0
 
     def _act(self, states: list[AgentState]) -> list[int]:
-        """One batched policy forward across all live agents."""
+        """One batched policy forward; returns a button mask per agent."""
         b = len(states)
         # short-term history: left-pad with the current frame repeated for the
         # first steps of an episode (no history yet) and the previous actions
         ws = self.w_s
+        n_act = self.policy.config.num_actions
         obs_hist = np.zeros((b, ws, self.image_size, self.image_size, 3), dtype=np.float32)
-        act_hist = np.zeros((b, ws, self.policy.config.num_actions), dtype=np.float32)
+        act_hist = np.zeros((b, ws, n_act), dtype=np.float32)
         for i, s in enumerate(states):
             # history is [prev pairs..., (current obs, no-op slot)]: the policy
             # predicts the action FOR the current observation, so the current
@@ -107,7 +166,7 @@ class InferenceRunner:
                 act_hist[i, pad + k, a] = 1.0
             if 0 < pad < ws:
                 obs_hist[i, :pad] = obs_hist[i, pad]  # repeat earliest frame
-        mem = np.zeros((b, self.w_l, self.image_size, self._image_w(), 3), dtype=np.float32)
+        mem = np.zeros((b, self.w_l, self.image_size, self.image_size, 3), dtype=np.float32)
         for i, s in enumerate(states):
             m = s.memory[-self.w_l:]
             pad = self.w_l - len(m)
@@ -118,15 +177,58 @@ class InferenceRunner:
         ft = torch.from_numpy(obs_hist).to(self.device)
         at = torch.from_numpy(act_hist).to(self.device)
         mt = torch.from_numpy(mem).to(self.device)
-        actions = self.policy.act(ft, at, mt)
-        return actions.cpu().tolist()
-
-    def _image_w(self) -> int:
-        return self.image_size
+        indices = self.policy.act(ft, at, mt)
+        # Policy index -> button mask: the environment has no notion of the
+        # policy's class indices.
+        return [self.action_space.mask_at(int(i)) for i in indices.cpu().tolist()]
 
     # ------------------------------------------------------------------
 
-    def run(self, envs: list[Any], delta: int, timeout_s: float = 8 * 3600) -> dict:
+    def random_rollout(self, env: Any, steps: int) -> dict:
+        """Uniformly random actions, run purely to widen the IDM's coverage.
+
+        The paper updates the IDM on the agents' trajectories *supplemented with
+        random-policy samples*.  Without them the IDM only ever sees the few,
+        heavily biased transitions the current (bad) policy produces, and cannot
+        label corpus frames whose dynamics it has never observed - which shows
+        up as the IDM answering every corpus pair with one constant class.
+
+        The safety gate applies here exactly as it does to the policy round:
+        random keystrokes on a menu screen are still menu selections.
+        """
+        rng = np.random.default_rng(0)
+        obs = self._frame(env.reset())
+        frames = [obs]
+        acts: list[int] = []
+        confirms = 0
+        for _ in range(max(0, int(steps))):
+            kind, reason = self._scene_gate([env])
+            if kind == "confirm":
+                confirms += 1
+                if confirms > self.max_confirm_presses:
+                    log.error("aborting random-policy rollout: %s", reason)
+                    break
+                press = getattr(env, "press_ok", None)
+                if press is not None:
+                    press()
+                continue
+            if kind == "abort":
+                log.error("aborting random-policy rollout: %s", reason)
+                break
+            confirms = 0
+            idx = int(rng.integers(len(self.action_space)))
+            obs = self._frame(env.step(self.action_space.mask_at(idx), frames=self.frame_skip))
+            frames.append(obs)
+            acts.append(idx)
+        return {"obs": np.asarray(frames), "act": np.asarray(acts, dtype=np.int64)}
+
+    def run(
+        self,
+        envs: list[Any],
+        delta: int,
+        timeout_s: float = 8 * 3600,
+        random_steps: int = 0,
+    ) -> dict:
         """Run all agents until one is stuck (timer >= delta) or max_steps."""
         states = [AgentState(agent_id=i) for i in range(len(envs))]
         # Prime every agent with its first observation.
@@ -135,38 +237,103 @@ class InferenceRunner:
             s.trajectory.append(s.obs)
         started = time.time()
         stuck_seen = False
+        abort_reason: str | None = None
+        confirms = 0
         while not stuck_seen and time.time() - started < timeout_s:
+            # Safety gate, before a single key is dispatched.  In RPG Maker the
+            # ok/cancel keys ARE the policy's jump/attack keys, so acting on a
+            # title or menu screen commits menu selections: an unattended run
+            # pressed Z on the title screen and loaded the player's save.
+            kind, reason = self._scene_gate(envs)
+            if kind == "confirm":
+                confirms += 1
+                if confirms > self.max_confirm_presses:
+                    abort_reason = (
+                        "confirm scene %s did not clear after %d ok presses"
+                        % (reason, self.max_confirm_presses)
+                    )
+                    log.error("aborting inference round: %s", abort_reason)
+                    break
+                log.info("pressing ok once to clear a confirm scene (%d/%d): %s",
+                         confirms, self.max_confirm_presses, reason)
+                for env in envs:
+                    press = getattr(env, "press_ok", None)
+                    if press is not None:
+                        press()
+                continue
+            if kind == "abort":
+                abort_reason = reason
+                log.error("aborting inference round: %s", abort_reason)
+                break
+            confirms = 0
             # Batched action selection for all agents.
-            actions = self._act(states)
-            for s, env, a in zip(states, envs, actions):
-                s.obs = self._frame(env.step(a))
+            masks = self._act(states)
+            for s, env, mask in zip(states, envs, masks):
+                # frame_skip game frames per action: the agent's timestep must
+                # match the corpus sampling interval, or the IDM is trained on
+                # one time scale and applied at another.
+                s.obs = self._frame(env.step(mask, frames=self.frame_skip))
                 s.trajectory.append(s.obs)
+                # Record the class index, not the mask: the IDM is trained on
+                # these as labels and its head is a classifier over the action
+                # space.  The mask is what the env consumes, the index is what
+                # the models speak; mixing them up silently mislabels every
+                # training pair (mask 3 is not class 3).
+                index = self.action_space.index_of(mask)
+                s.actions.append(index)
                 s.short_obs.append(s.obs)
-                s.short_act.append(a)
+                s.short_act.append(index)
                 if len(s.short_obs) > self.w_s:
                     s.short_obs.pop(0)
                     s.short_act.pop(0)
                 s.steps += 1
-                # Key-moment detection on the new observation.
-                if s.steps % 4 == 0:  # embed every 4th frame to keep up with 20 fps
-                    emb = self.kdm.embedder.embed(s.obs[None])[0]
-                    if self.kdm.classify(emb, s.seen_clusters):
-                        s.memory.append(s.obs)
-                        s.stuck_timer = 0
-                        s.seen_clusters.add(self.kdm.cluster_of(emb))
-                    else:
-                        s.stuck_timer += 4
+                # Key-moment detection on every observation.  A step is now
+                # control_interval_s of game time, so the stuck timer counts
+                # *steps without a new key moment* - which is what the paper's
+                # Delta means - instead of the old mix of frames and steps.
+                emb = self.kdm.embedder.embed(s.obs[None])[0]
+                if self.kdm.classify(emb, s.seen_clusters):
+                    s.memory.append(s.obs)
+                    s.stuck_timer = 0
+                    s.seen_clusters.add(self.kdm.cluster_of(emb))
                 else:
                     s.stuck_timer += 1
                 if s.stuck_timer >= delta:
                     stuck_seen = True
             if any(s.steps >= self.max_steps for s in states):
                 break
+        # The paper supplements the IDM's agent transitions with random-policy
+        # samples; without them the IDM only sees what the current policy
+        # happened to do and cannot label unseen dynamics.
+        random_trajectories: list[dict] = []
+        if random_steps > 0 and not abort_reason:
+            for env in envs:
+                traj = self.random_rollout(env, random_steps)
+                if len(traj["act"]):
+                    random_trajectories.append(traj)
+            log.info(
+                "random-policy rollout: %d transitions",
+                sum(len(t["act"]) for t in random_trajectories),
+            )
+        # Each trajectory is a dict, not a bare array: bootstrap needs the
+        # executed masks alongside the frames to retrain the IDM, and the masks
+        # cannot be recovered from the frames afterwards.
         return {
-            "trajectories": [np.asarray(s.trajectory) for s in states],
+            "trajectories": [
+                {
+                    "obs": np.asarray(s.trajectory),
+                    "act": np.asarray(s.actions, dtype=np.int64),
+                }
+                for s in states
+            ],
+            "random_trajectories": random_trajectories,
             "memories": [list(s.memory) for s in states],
             "steps": [s.steps for s in states],
             "stuck": stuck_seen,
+            #: Non-None when the round stopped for safety instead of getting
+            #: stuck; the orchestrator records it so a truncated round is
+            #: never mistaken for a converged one.
+            "aborted": abort_reason,
         }
 
     def _seen_clusters(self, state: AgentState) -> set[int]:

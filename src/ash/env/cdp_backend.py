@@ -25,8 +25,14 @@ from typing import Any
 
 import numpy as np
 
-from ash.actions import ActionSpace, buttons_from_mask
-from ash.capture.screencast import CdpConnection, CdpError, Target, list_targets
+from ash.actions import ActionSpace, buttons_from_mask, mask_from_buttons
+from ash.capture.screencast import (
+    CdpConnection,
+    CdpError,
+    Target,
+    UnsafeSceneError,
+    list_targets,
+)
 from ash.config import GameConfig, KeyBinding, load_game_config
 from ash.env.base import Obs, StepResult
 from ash.memory.js_source import js_source
@@ -67,7 +73,14 @@ class CdpSpeedrunEnv:
         seed: int = 1,
         target_index: int = 0,
         auto_connect: bool = True,
+        enforce_safety: bool = True,
     ) -> None:
+        #: Refuse to dispatch gameplay input outside Scene_Map.  Only the
+        #: diagnostic key probes opt out, and they do so explicitly - the
+        #: default has to be safe, because the failure it prevents (an
+        #: untrained policy pressing its way into the player's save) is
+        #: destructive and silent.
+        self.enforce_safety = enforce_safety
         self.game_config = config or load_game_config()
         self.config = CdpConfig(
             endpoint=endpoint or self.game_config.cdp_endpoint,
@@ -302,12 +315,26 @@ class CdpSpeedrunEnv:
             if self.config.keymap.get(b) and self.config.keymap[b].names
         ]
 
+    def _check_safe(self) -> None:
+        """Refuse to touch the keyboard outside Scene_Map gameplay.
+
+        The runner asks unsafe_reason() before it acts, but this is the
+        backstop: no caller, however written, gets to press gameplay keys on a
+        title or menu screen, where those same keys mean "confirm".
+        """
+        if not self.enforce_safety:
+            return
+        reason = self.unsafe_reason()
+        if reason:
+            raise UnsafeSceneError("refusing to dispatch input: %s" % reason)
+
     def apply_action(self, action: int, *, settle_ms: float | None = None) -> None:
         """Press the buttons of an action mask, then release them.
 
         The release is unconditional: a game that never sees a keyup keeps a
         button held forever, which turns a single mistake into a broken episode.
         """
+        self._check_safe()
         for binding in self._bindings_for(action):
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
         if settle_ms:
@@ -337,6 +364,7 @@ class CdpSpeedrunEnv:
         """
         if self.conn is None:
             raise CdpError("not connected")
+        self._check_safe()
         count = max(1, int(frames))
         if self._pump_installed:
             bindings = self._bindings_for(action)
@@ -1047,6 +1075,89 @@ class CdpSpeedrunEnv:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise CdpError("state() got non-JSON: %s" % raw[:200]) from exc
+
+    # ----------------------------------------------------------------- safety
+    _SAFETY_EXPR = "window.__ash ? JSON.stringify(__ash.safety()) : null"
+    _check_js(_SAFETY_EXPR, "_SAFETY_EXPR")
+
+    def safety(self) -> dict[str, Any]:
+        """In-page safety readout: current scene, and whether input is allowed.
+
+        Returns {} when the agent is not installed, which callers must treat as
+        unsafe rather than as "no objection".
+        """
+        if self.conn is None:
+            raise CdpError("not connected")
+        raw = self.conn.evaluate(self._SAFETY_EXPR, timeout=10.0)
+        if raw is None:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CdpError("safety() got non-JSON: %s" % raw[:200]) from exc
+
+    def unsafe_reason(self) -> str | None:
+        """Why the keyboard must not be touched right now, or None if it may.
+
+        The policy's verbs are gameplay verbs, but RPG Maker's ok/cancel keys
+        are the same keys - so on a title or menu screen a "jump" press commits
+        a menu selection, and with a save present that selection can load (or
+        overwrite) it.  Anything that is not Scene_Map is unsafe, and so is an
+        unreadable scene: failing closed is the point.
+        """
+        try:
+            info = self.safety()
+        except CdpError as exc:
+            return "safety probe failed (%s)" % (str(exc)[:120],)
+        if not info:
+            return "safety probe unavailable: agent.js not installed"
+        if not info.get("inGameplay"):
+            return "scene %r is not Scene_Map gameplay" % (info.get("scene"),)
+        return None
+
+    def is_confirm_scene(self) -> bool:
+        """True when the current scene is one a single "ok" press may dismiss.
+
+        The allow-list lives in agent.js (V.CONFIRM_SCENES) so there is exactly
+        one definition.  The hard gate stays in force for everything else.
+        """
+        try:
+            return bool(self.safety().get("confirm"))
+        except CdpError:
+            return False
+
+    def _confirm_mask(self) -> int:
+        """The mask for the game's "ok" button, from the configured keymap."""
+        names = self.game_config.keymap
+        for name in ("interact", "jump"):
+            binding = names.get(name)
+            if binding and binding.names:
+                return mask_from_buttons([name])
+        raise CdpError("no ok button bound in the keymap (need interact or jump)")
+
+    def press_ok(self) -> bool:
+        """Press ONLY the ok button, and only on an allow-listed confirm scene.
+
+        The scene gate exists because ok/cancel ARE the policy's jump/attack
+        keys, so ok on a menu commits a selection - that is how a live run
+        loaded the player's save.  But some non-gameplay scenes are input-gated
+        rather than menu-like: the game's own transition screen waits for ok and
+        never advances without it, so refusing all input does not protect
+        anything, it just parks the game there permanently.
+
+        This is the whole exception: one named button, an allow-listed scene,
+        no random action, and the caller bounds how many times it may happen.
+        """
+        if not self.is_confirm_scene():
+            raise UnsafeSceneError(
+                "press_ok refused: scene %r is not in the confirm allow-list"
+                % (self.safety().get("scene"),)
+            )
+        for binding in self._bindings_for(self._confirm_mask()):
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
+        for binding in self._bindings_for(self._confirm_mask()):
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+        return True
 
     def game_frame_count(self) -> int:
         if self.conn is None:

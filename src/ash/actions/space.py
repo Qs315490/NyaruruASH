@@ -34,6 +34,13 @@ BUTTONS: tuple[str, ...] = (
 
 BUTTON_INDEX: dict[str, int] = {name: i for i, name in enumerate(BUTTONS)}
 
+# Size of the default action space.  Both model heads (policy and IDM) must be
+# built with exactly this many outputs, so it is declared once here instead of
+# being repeated as a magic number in each model.  tests/test_action_space.py
+# asserts it still equals len(ActionSpace.minimal()), which is what keeps the
+# constant from drifting away from the space it describes.
+DEFAULT_NUM_ACTIONS = 16
+
 
 def mask_from_buttons(buttons: Iterable[str]) -> int:
     """Build a bit mask from an iterable of button names."""

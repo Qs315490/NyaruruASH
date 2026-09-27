@@ -71,6 +71,52 @@
     });
   };
 
+  /* ----------------------------------------------------------------- safety */
+  /* Is it safe to press a gameplay button right now?
+
+     The policy's action space is built from gameplay verbs (jump = Z,
+     attack = X, ...), but RPG Maker's ok/cancel keys ARE Z and X.  On the
+     title screen a single "jump" press selects whichever entry is
+     highlighted - and when a save exists the highlighted entry loads it.  An
+     untrained policy left alone on a non-gameplay screen therefore presses
+     its way into the player's save file, which is exactly what happened on
+     the first live run.
+
+     So input is only ever dispatched inside Scene_Map.  Every other scene
+     reports inGameplay false and the Python side refuses to touch the
+     keyboard.  Unknown state fails closed: a scene we cannot read is not a
+     scene we are willing to press buttons in. */
+  V.GAMEPLAY_SCENE = "Scene_Map";
+
+  /* Scenes that need exactly one "ok" to continue and where ok commits nothing
+     destructive - the game's own transition screens.  They are input-gated, so
+     refusing all input does not protect anything: it just parks the game there
+     forever.  That is not hypothetical, it happened.
+
+     Menus are deliberately NOT here.  On Scene_Title/Scene_Menu/Scene_File the
+     same ok press selects a menu entry, which is how a live run loaded the
+     player's save.  This list may only ever contain screens whose ok does one
+     thing: continue. */
+  V.CONFIRM_SCENES = ["Scene_Transport"];
+
+  V.safety = function () {
+    var scene = V.sceneName();
+    var busy = guard("messageBusy", function () {
+      var m = window.$gameMessage;
+      return !!(m && m.isBusy && m.isBusy());
+    });
+    return {
+      scene: scene,
+      messageBusy: !!busy,
+      // Only Scene_Map takes gameplay verbs.  sceneName() returns null both
+      // before the game boots and when the read throws, and null !==
+      // GAMEPLAY_SCENE, so the fail-closed case is handled by this comparison.
+      inGameplay: scene === V.GAMEPLAY_SCENE,
+      // One ok press is safe here (and required); nothing else is.
+      confirm: V.CONFIRM_SCENES.indexOf(scene) >= 0
+    };
+  };
+
   V.frameCount = function () {
     return guard("frameCount", function () {
       var g = window.Graphics;

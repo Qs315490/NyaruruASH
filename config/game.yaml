@@ -9,6 +9,18 @@ cdp_port: 9222
 cdp_endpoint: http://127.0.0.1:9222
 fps: 60                       # RPG Maker MZ 的 SceneManager 逻辑帧率
 
+# 控制间隔 = 相邻两次「观测 + 动作」之间隔多少游戏时间（秒）。
+#
+# 这是**整条流水线唯一的时间尺度来源**，必须显式写出来：它一旦是隐式的就会静默毁掉
+# 一切。实测踩过：agent 每步只推进 1 游戏帧（1/60 s），而语料按 2 s 抽帧，于是 IDM
+# 学的是「解释 1/60 s 变化的那一个动作」，却被拿来标注相隔 2 s 的帧——它 99.8% 的
+# 时候只输出同一个类，π 便靠预测这个常数类「收敛」到 policy_val ~1e-6。
+#
+# 论文（Appendix G）用 0.25 s 作环境 timestep、语料同尺度；这里照抄，并让 agent 步长
+# （control_frame_skip = 0.25*60 = 15 帧）与语料抽帧率（corpus_fps = 1/0.25 = 4 fps）
+# 都由它派生。
+control_interval_s: 0.25
+
 window:
   title_contains: ["Nyaruru", "咸鱼喵喵"]
   capture:                    # X11 后端（保底方案）的抓取区域，需按实际窗口调整

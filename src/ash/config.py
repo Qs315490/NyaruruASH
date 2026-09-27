@@ -52,8 +52,29 @@ class GameConfig:
     cdp_port: int = 9222
     window: dict[str, Any] = field(default_factory=dict)
     fps: int = 60
+    #: Seconds of game time between two consecutive agent observations/actions.
+    #:
+    #: This is THE single source of truth for the whole pipeline's time scale,
+    #: and it exists because leaving it implicit broke everything silently: the
+    #: agent stepped one game frame (1/60 s) while the corpus was sampled every
+    #: 2 s, so the IDM learned which action explains a 1/60 s change and was then
+    #: asked to label 2 s changes.  It answered with one constant class 99.8% of
+    #: the time, and pi "converged" by predicting that class.  The paper uses
+    #: 0.25 s for the environment timestep AND for the corpus, so both sides are
+    #: derived from this number now (see control_frame_skip and corpus_fps).
+    control_interval_s: float = 0.25
     keymap: dict[str, KeyBinding] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def control_frame_skip(self) -> int:
+        """Game frames to advance per agent action (0.25 s * 60 fps = 15)."""
+        return max(1, int(round(self.control_interval_s * self.fps)))
+
+    @property
+    def corpus_fps(self) -> float:
+        """Corpus sampling rate that matches the agent's timestep (4 fps)."""
+        return 1.0 / self.control_interval_s
 
 
 def load_game_config(path: str | Path | None = None) -> GameConfig:
@@ -79,11 +100,7 @@ def load_game_config(path: str | Path | None = None) -> GameConfig:
         cdp_port=int(data.get("cdp_port", 9222)),
         window=data.get("window", {}) or {},
         fps=int(data.get("fps", 60)),
+        control_interval_s=float(data.get("control_interval_s", 0.25)),
         keymap=keymap,
         raw=data,
     )
-
-
-def load_milestones(path: str | Path | None = None) -> list[dict[str, Any]]:
-    data = _load_yaml(resolve_path(path) if path else CONFIG_DIR / "milestones" / "ending1.yaml")
-    return list(data.get("milestones", []))

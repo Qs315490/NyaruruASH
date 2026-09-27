@@ -45,6 +45,10 @@ class LoopConfig:
     round_timeout_s: float = 8 * 3600
     #: max bootstraps before giving up (safety for unattended runs)
     max_bootstraps: int = 64
+    #: random-policy steps per round, added to the IDM's training set.  The
+    #: paper supplements the agent's own transitions this way; without it the
+    #: IDM only sees the narrow slice of dynamics the current policy produces.
+    random_steps: int = 100
     #: where checkpoints and reports are written
     out_dir: Path = field(default_factory=lambda: Path("runs/ash"))
 
@@ -87,9 +91,16 @@ class Orchestrator:
                 kdm=self.kdm,
                 delta=self.config.delta,
                 timeout_s=self.config.round_timeout_s,
+                random_steps=self.config.random_steps,
             )
-            trajectories = result["trajectories"]          # list of obs arrays
-            seen_stats = result.get("stats", {})
+            trajectories = result["trajectories"]          # list of {"obs","act"}
+            random_trajectories = result.get("random_trajectories", [])
+            seen_stats = {
+                "steps": result.get("steps"),
+                "stuck": result.get("stuck"),
+                "key_moments": [len(m) for m in result.get("memories", [])],
+                "aborted": result.get("aborted"),
+            }
             log.info(
                 "inference round %d: %d agents, stats=%s (%.0fs)",
                 self.bootstrap_round,
@@ -101,7 +112,9 @@ class Orchestrator:
             # Step 2: retrieval per agent trajectory, union into D^R.
             retrieved: list[tuple[str, float]] = []
             for traj in trajectories:
-                emb = self.embedder.embed(np.asarray(traj))
+                # A trajectory is {"obs": (T,H,W,C), "act": (T,)}; retrieval only
+                # needs the frames.
+                emb = self.embedder.embed(np.asarray(traj["obs"]))
                 retrieved.extend(retrieve(emb, self.corpus_index, self.config.w_r, self.config.top_k))
             vid_rank: dict[str, int] = {}
             for vid, score in retrieved:
@@ -115,6 +128,7 @@ class Orchestrator:
                 idm=self.idm,
                 kdm=self.kdm,
                 trajectories=trajectories,
+                random_trajectories=random_trajectories,
                 retrieved_ids=d_r,
                 out_dir=self.config.out_dir / f"bootstrap-{self.bootstrap_round:03d}",
             )

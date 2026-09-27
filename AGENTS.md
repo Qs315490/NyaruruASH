@@ -17,10 +17,45 @@
      （`tests/test_matching.py` 钉死）。
 3. **不确定就停下确认**，不要臆测。
 4. **环境**：uv 管依赖，`export UV_CACHE_DIR=$PWD/.uv-cache UV_PYTHON_INSTALL_DIR=$PWD/.uv-python`；
-   GPU 任务必须 `HSA_OVERRIDE_GFX_VERSION=11.0.0`；256 分辨率训练用
-   `--batch-size 16 --accum-steps 2`（游戏与训练共享 12G 显存）。
+   **不要设 `HSA_OVERRIDE_GFX_VERSION`**。本机是 RX 7700 XT（`gcnArchName=gfx1101`，12G），
+   装的 torch wheel 是 `device-gfx1101`，原生检测即可。实测设 `11.0.0`/`11.0.2` 会
+   `hipErrorInvalidKernelFile`（运行时声称 gfx1100，而 wheel 里只有 gfx1101 内核）；
+   真要覆盖只有 `11.0.1` 可用。256 分辨率训练用 `--batch-size 16 --accum-steps 2`
+   （游戏与训练共享 12G 显存）。
 5. **重启游戏**需 `rm -rf .nw-profile/SingletonLock`（`.nw-profile/` 是本地运行时目录，不在仓库里）；绝不要 `pkill -f 'nw.exe'`
    （宽匹配会误杀进程）。
+6. **实机输入必须过场景护栏，不许绕过**。在 MZ 里 `jump` 就是「确定」键（Z）、
+   `attack` 就是「取消」键（X），所以策略在标题/菜单画面上按一下跳跃就等于提交菜单
+   选项——**首次实机自举就是这样进入了玩家的存档**。因此：
+   - 只在 `Scene_Map` 内派发按键：`agent.js` 的 `V.safety()` → `cdp_backend.unsafe_reason()`
+     → `_check_safe()`（`apply_action`/`step_frame` 的硬闸），读不到场景一律**失败即拒**；
+   - 不许为了「先跑起来」关掉护栏，也不许新开一条绕过 `_check_safe()` 的按键派发路径；
+     诊断探针确需原始按键时必须显式 `enforce_safety=False` 并写明理由；
+   - **唯一的例外是 `V.CONFIRM_SCENES` 白名单**（目前只有 `Scene_Transport`，游戏自己的
+     过场画面）。这类画面**不会自己结束、必须按一次确定**，所以「一律不按键」不是保护
+     而是把游戏永久停在那里（实测发生过）。白名单场景只允许 `press_ok()`：**只按
+     keymap 里的确定键**（`interact`/`jump`），绝不按随机动作，且 `max_confirm_presses`
+     有上限，超过就中止。**菜单类（Scene_Title/Scene_Menu/Scene_File/Scene_Load/
+     Scene_Save…）永远不得进白名单**——那里的确定就是「选中菜单项」。白名单只有
+     `agent.js` 一处定义，避免漂移。
+   - 实机启动前 CLI 会先查一次场景，不在游戏内且不在白名单里就拒绝启动（退出码 3）；
+   - **退出时保持暂停是刻意的，不要「修」成自动恢复**。`close(resume=False)` 停掉
+     ticker，为的是不让角色在无人操作时被敌人打死。代价是「跑完游戏像卡住了」，所以
+     缺陷是它**太安静**、不是它发生了：CLI 退出时必须说明游戏被留在暂停态以及怎么
+     恢复（页面里 `__ash.pump.resume()`，或 `close(resume=True)`，或重启游戏）。
+     要交还控制权必须由人显式要求。
+   三层护栏 + 暂停退出 + 确认白名单由 `tests/test_safety.py` 钉死。
+7. **时间尺度只有一个来源：`config/game.yaml:control_interval_s`**（论文 Appendix G
+   用 0.25 s）。agent 每步推进 `control_frame_skip = 0.25*60 = 15` 帧，语料按
+   `corpus_fps = 4` 抽帧，两者都由它派生。**不许再写死第二处**：IDM 是在 agent 的
+   (obs[t], obs[t+1]) 上训的、却用在语料帧上，两边 Δt 必须相同。实测踩过 120× 的
+   错配（agent 1 帧 vs 语料 2 s）。`tests/test_time_scale.py` 钉死派生关系与
+   CLI 的不一致拦截（退出码 4）。
+8. **伪标签退化时必须拒绝更新 π，不许「先训了再说」**。实测：IDM 的逐帧 logits 方差
+   0.008 而类间偏置高达 0.13，即 **argmax 完全由偏置决定、与输入无关**；随机初始化的
+   IDM 就已经 97% 输出同一个类。在常数目标上训 π 只会把它教成「永远输出同一个动作」，
+   而 `policy_val ~1e-6` 看起来像收敛。`bootstrap.pseudo_label_stats` +
+   `max_pseudo_majority=0.9` 会跳过更新并报错，由 `tests/test_pseudo_labels.py` 钉死。
 
 ## 架构速览
 
@@ -45,4 +80,12 @@ uv sync
 .venv/bin/python -m pytest tests -q
 ```
 
-14 项全过才算改动成立。`tests/test_loop.py` 是 fake 后端端到端 smoke。
+73 项全过才算改动成立。四个测试文件各钉死一类静默失败：
+- `tests/test_loop.py`：三个动作维度（BUTTONS / ActionSpace / 策略类别数）必须同源、
+  轨迹的 `act` 是「每个转移一个标签」（长度 T-1，不是 T）、策略训练目标是窗口内每个
+  位置、bootstrap 必须按 D^R 裁剪语料（否则检索是空操作）。
+- `tests/test_safety.py`：实机输入护栏三层（场景探针失败即拒 / 后端硬闸不派发按键 /
+  runner 中止该轮）+ 退出保持暂停 + 确认白名单只按确定键且菜单场景被拒。
+- `tests/test_time_scale.py`：`control_interval_s` 派生出的 agent 步长与语料抽帧率必须
+  一致，CLI 不一致时拒绝启动。
+- `tests/test_pseudo_labels.py`：伪标签退化成常数时不得更新 π，且必须报告。
