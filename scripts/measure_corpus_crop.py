@@ -22,16 +22,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ash.memory.embeddings import FrameEmbedder  # noqa: E402
 from ash.memory.kdm import KeyMomentModel  # noqa: E402
 
-#: Rects found by searching for the crop that maximises cosine against a live
-#: frame (x0, y0, x1, y1 as fractions).  Per video: the layout differs.
-CROPS = {
-    "0r2lVc1uKa0": (0.00, 0.00, 0.85, 0.85),
-    "61no6YQJLuQ": (0.00, 0.00, 1.00, 0.80),
-    "BV13HnzzPEEN": (0.20, 0.15, 1.00, 1.00),
-    "BV19s4y1y7un": (0.25, 0.05, 1.00, 0.80),
-    "BV1Am4y1t7Sv": (0.20, 0.05, 0.85, 0.80),
-    "eIuH528wp4c": (0.00, 0.00, 1.00, 1.00),
-}
+import sys as _sys
+
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from detect_game_rect import detect  # noqa: E402
+
+
+def crop_43(frame: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
+    """Crop to the game rectangle and restore the live window's 4:3 aspect.
+
+    The stored frames hold a square game area while the live window is 4:3, so the
+    embedder squashes the live frame and not the video frame unless this is undone.
+    """
+    x0, y0, x1, y1 = rect
+    piece = frame[y0:y1, x0:x1]
+    height = piece.shape[0]
+    return cv2.resize(piece, (int(height * 4 / 3), height), interpolation=cv2.INTER_AREA)
 
 
 def main() -> int:
@@ -40,19 +46,20 @@ def main() -> int:
     live_emb = emb.embed(live[None])[0]
 
     out: dict[str, np.ndarray] = {}
-    for stem, (x0, y0, x1, y1) in CROPS.items():
+    for stem in sorted(p.stem for p in Path("data/corpus").glob("*.npy")):
+        rect = detect(stem)
         arr = np.load("data/corpus/%s.npy" % stem, mmap_mode="r")
         # (T, H, W, C): the spatial axes are 1 and 2.  Slicing the first two
         # indexes crops TIME, which is what an earlier version of this script did
         # - it embedded 217 "frames" of a 9405-frame video and reported a
         # meaningless similarity.
-        n, h, w = arr.shape[0], arr.shape[1], arr.shape[2]
-        ys, xs = slice(int(h * y0), int(h * y1)), slice(int(w * x0), int(w * x1))
+        n = arr.shape[0]
         chunks = []
         for i in range(0, n, 256):
-            block = np.asarray(arr[i:i + 256, ys, xs])
+            block = np.asarray(arr[i:i + 256])
             chunks.append(emb.embed(np.stack([
-                cv2.resize(f, (256, 256), interpolation=cv2.INTER_AREA) for f in block])))
+                cv2.resize(crop_43(f, rect), (256, 256), interpolation=cv2.INTER_AREA)
+                for f in block])))
         out[stem] = np.concatenate(chunks)
         print("%-14s %d frames -> nearest live cosine %.4f"
               % (stem, len(out[stem]), float((out[stem] @ live_emb).max())))

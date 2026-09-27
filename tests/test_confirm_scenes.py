@@ -56,9 +56,24 @@ def _confirm_scenes() -> list[str]:
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def test_confirm_scene_list_is_empty():
-    """Nothing is proven safe to press ok on, so nothing may be listed."""
-    assert _confirm_scenes() == []
+#: The scenes whose ok is PROVEN to do exactly one thing.  `Scene_ItemObtain`
+#: binds pressOk to popScene (nya_game.js), so ok closes the popup and commits
+#: nothing; a live run aborted the whole rollout on it because it was unlisted
+#: ("scene 'Scene_ItemObtain' is not Scene_Map gameplay"), stalling the agent
+#: every time it picked an item up.
+PROVEN = {"Scene_ItemObtain"}
+
+
+def test_only_proven_popups_are_allow_listed():
+    """An entry needs a proof, and the list is exactly the proven set."""
+    assert set(_confirm_scenes()) == PROVEN, _confirm_scenes()
+
+
+def test_an_unproven_popup_is_not_allow_listed():
+    """Adding a scene because it looks harmless is the Scene_Transport mistake."""
+    for guess in ("Scene_Popup", "Scene_HardGuide", "Scene_AdWaiting",
+                  "Scene_NotificationBar", "Scene_Story", "Scene_Staff"):
+        assert guess not in _confirm_scenes(), guess
 
 
 @pytest.mark.parametrize("scene", MENU_SCENES)

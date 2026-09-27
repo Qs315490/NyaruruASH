@@ -104,7 +104,22 @@
      ok selects among entries, or its effect depends on what is highlighted, it
      is a menu and belongs on the forbidden side no matter how harmless the
      screen looks. */
-  V.CONFIRM_SCENES = [];
+  /* First entry, and the proof the list was waiting for.  `Scene_ItemObtain` is
+     the "you got an item" popup, and the game itself says ok does exactly one
+     thing (nya_game.js):
+
+         Scene_ItemObtain.prototype.createObtain = function () {
+             this._obtainItem = new Sprite_ItemObtain({...});
+             this._obtainItem.pressOk = this.popScene.bind(this);   // ok = close
+         };
+
+     No entry is highlighted, nothing is selected, nothing is committed - the
+     handler is `popScene`.  Refusing it aborted the round instead: measured in
+     a live run, "aborting random-policy rollout: scene 'Scene_ItemObtain' is not
+     Scene_Map gameplay", which also stops the agent dead every time it picks
+     something up.  Anything whose ok selects among entries stays forbidden no
+     matter how harmless it looks. */
+  V.CONFIRM_SCENES = ["Scene_ItemObtain"];
 
   /* Scenes where CANCEL is a back-out and cannot commit anything.
 
@@ -194,7 +209,19 @@
     "STATIC_TEXT_MENU_SYSTEM_RETURN_TO_TITLE",
     "STATIC_TEXT_MENU_SYSTEM_RETURN_LOAD_GAME",
     "STATIC_TEXT_MENU_SYSTEM_OPTIONS",
-    "STATIC_TEXT_MENU_SYSTEM_EXIT_GAME"
+    "STATIC_TEXT_MENU_SYSTEM_EXIT_GAME",
+    /* The GAME OVER screen asks "continue?" with two options, captured from the
+       running game:
+         _titleText = STATIC_TEXT_GAMEOVER_CONTINUE
+         _selectBox._selected = "up"|"down", and its sprites carry
+           up   = STATIC_TEXT_CONTINUE_YES   (load the save - the game's own
+                                              continue path, the operator allows it)
+           down = STATIC_TEXT_CONTINUE_NO    (return to town - not allowed)
+       Refusing the whole screen aborted every round the character died in, which
+       the trap in map 8 makes routine: it re-applies a 60-frame stagger every 30
+       frames, so the character cannot recover, and once it dies the teleport out
+       is skipped by the game's own `!isDeath()` guard. */
+    "STATIC_TEXT_CONTINUE_NO"
   ];
   /* Scenes the agent may operate rather than only escape.  The rest of
      V.MENU_SCENES stays cancel-only.
@@ -206,7 +233,7 @@
      as PANELS inside Scene_Menu, and its "skill" panel is a page that
      demonstrates which key triggers which action.  Listing unobserved scenes
      reads as coverage without being any - add one only after seeing it. */
-  V.OPERABLE_SCENES = ["Scene_Menu", "Scene_Shop", "Scene_SkillSt"];
+  V.OPERABLE_SCENES = ["Scene_Menu", "Scene_Shop", "Scene_SkillSt", "Scene_Gameover"];
   V.menuEntries = function () {
     var s = window.SceneManager && SceneManager._scene;
     if (!s) { return []; }
@@ -248,6 +275,18 @@
       } catch (e) { /* a probe must never break the scene */ }
     };
     walk(s, 0);
+    /* The GAME OVER screen is neither a Window nor a menu panel: its cursor is
+       Sprite_GameoverBox._selected ("up"/"down") and each option's symbol lives on
+       the sprite that draws it.  Read so that dying is recoverable - with the
+       operator's rule that only "load the save" may be committed. */
+    var box = s._selectBox;
+    if (box && (box._selected === "up" || box._selected === "down")) {
+      var sprite = box._selected === "up" ? box._buttonUpSelected : box._buttonDownSelected;
+      var label = sprite && sprite._text;
+      if (label) {
+        out.push({panel: "_selectBox", name: String(label), index: box._selected});
+      }
+    }
     return out;
   };
   V.isGuardedEntry = function (entries) {

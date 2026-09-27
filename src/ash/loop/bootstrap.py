@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from ash.actions.space import ActionSpace, buttons_from_mask
 from ash.memory.kdm import KeyMomentModel
 from ash.models.ash_policy import AshPolicy, save_policy
 from ash.models.idm import IdmModel, save_idm
@@ -65,7 +66,22 @@ class BootstrapConfig:
     max_pseudo_majority: float = 0.9
 
 
-def pseudo_label_stats(dataset: dict[str, np.ndarray] | WindowDataset, num_actions: int) -> dict:
+def action_names(num_actions: int) -> list[str]:
+    """Human-readable name per action class, for the pseudo-label report.
+
+    `majority_share` without a class name cannot answer the question it exists
+    for: a corpus whose labelling is 60% one class is being taught to run if that
+    class is "right" and to stand still if it is noop.
+    """
+    masks = ActionSpace.minimal().masks
+    names = [", ".join(buttons_from_mask(mask)) or "noop" for mask in masks]
+    # The IDM's width is pinned to the same space by tests; a mismatch here must
+    # not silently mislabel classes, so only the classes that exist are named.
+    return names[:num_actions]
+
+
+def pseudo_label_stats(dataset: dict[str, np.ndarray] | WindowDataset, num_actions: int,
+                       names: list[str] | None = None) -> dict:
     """How concentrated is the IDM's labelling of one corpus video?
 
     Returns counts and the share of the single most common class.  The first
@@ -86,13 +102,19 @@ def pseudo_label_stats(dataset: dict[str, np.ndarray] | WindowDataset, num_actio
                 "entropy": 0.0, "uniform_entropy": float(np.log(num_actions))}
     counts = np.bincount(labels, minlength=num_actions).astype(np.float64)
     p = counts[counts > 0] / counts.sum()
-    return {
+    majority = int(counts.argmax())
+    out = {
         "labels": int(labels.size),
         "classes_used": int((counts > 0).sum()),
         "majority_share": float(counts.max() / counts.sum()),
+        "majority_class": majority,
+        "noop_share": float(counts[0] / counts.sum()),
         "entropy": float(-(p * np.log(p)).sum()),
         "uniform_entropy": float(np.log(num_actions)),
     }
+    if names and 0 <= majority < len(names):
+        out["majority_class_name"] = names[majority]
+    return out
 
 
 def logit_diagnosis(pair_logits: np.ndarray | None) -> dict:
@@ -579,7 +601,8 @@ class Bootstrapper:
                 continue
             log.info("policy dataset %d/%s: %s built in %.1fs (%d windows)",
                      n, total, vid, time.time() - started, len(ds))
-            stats = pseudo_label_stats(ds, idm.config.num_actions)
+            stats = pseudo_label_stats(ds, idm.config.num_actions,
+                                       action_names(idm.config.num_actions))
             stats["video"] = vid
             stats.update(logit_diagnosis(ds.logits))
             label_stats.append(stats)

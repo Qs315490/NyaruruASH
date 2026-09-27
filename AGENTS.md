@@ -79,6 +79,23 @@
      - **任一**面板的高亮条目命中拒绝名单 → 拒绝（哪个面板在处理输入是游戏的事，
        「任一命中即拒」是安全的一侧：误拒只赔一轮，误放赔存档）；
      - **读不到高亮条目的可操作场景一律拒绝**（fail closed，分类不了的可能就是危险的那个）。
+     - **死亡后的 `Scene_Gameover` 也放开，但只许「读取存档」**（第三次放宽，方案已选定）。
+       它同样**不是 MZ 的窗口**：标题 `_titleText=STATIC_TEXT_GAMEOVER_CONTINUE`（「是否继续？」），
+       光标是 `Sprite_GameoverBox._selected ∈ {up,down}`，两个选项的符号画在各自的 sprite 上：
+       ```
+       up   = STATIC_TEXT_CONTINUE_YES   → 读取存档（游戏自己的 continue 路径）← 放行
+       down = STATIC_TEXT_CONTINUE_NO    → 返回小镇                        ← 拒绝
+       ```
+       拒绝整屏的代价是**每次死亡都中止该轮、要人来救**，而 map 8 的陷阱让死亡变成常态：
+       ```js
+       performTerrainDamage(): terrainDamageCD = 30;      // 每 30 帧重新施加
+                              _staggerTime = 60;          // 后摇 60 > 30 → 永远走不完
+       挨打无敌帧 = beHitInvincibleTime - 10 = 80         // 不会跟着刷新 → 无敌先耗尽
+       if (_delayRevert <= 0 && !isDeath()) revertToLastGroundingPos();   // 死了就不传送
+       ```
+       实测（角色死在陷阱上的那一帧）：`_invincibleTime=0` 而 `_staggerTime=36`、
+       `terrainDamageCD=7`、`hp=0`、`_delayRevert=6` —— **无敌帧确实没撑到后摇之后**，
+       且 `!isDeath()` 让传送永不结算。
    - 不许为了「先跑起来」关掉护栏，也不许新开一条绕过 `_check_safe()` 的按键派发路径；
      诊断探针确需原始按键时必须显式 `enforce_safety=False` 并写明理由；
    - **菜单可以「只按取消键」退出，但这不等于放开护栏**。agent 会自己按进菜单
@@ -93,9 +110,26 @@
      **游戏按键**，正是这道闸门要防的事。
      自定义场景只有在**实测 cancel 能退出且不提交任何东西**之后才准进 `MENU_SCENES`
      （`Scene_SkillSt` 实测：2 次 cancel 回到 `Scene_Map`，map/hp 不变）。
-   - **`V.CONFIRM_SCENES` 目前是空列表，而且必须保持为空**，直到某个场景被**证明**
-     只需要一次 ok 且 ok 不做任何提交。机制本身留着（`press_ok()`：只按 keymap 的确定键，
-     有 `max_confirm_presses` 上限），但名单为空。
+   - **`V.CONFIRM_SCENES` 现在只有一个成员，而且每个成员都必须有「ok 只做一件事」的证明**：
+     `Scene_ItemObtain`（拿到道具的弹窗）——游戏自己的绑定就是证明（`nya_game.js`）：
+     ```js
+     Scene_ItemObtain.prototype.createObtain = function () {
+         this._obtainItem = new Sprite_ItemObtain({...});
+         this._obtainItem.pressOk = this.popScene.bind(this);   // ok = 关闭，无高亮条目、无提交
+     };
+     ```
+     实测的代价：不列它时实机日志是
+     `aborting random-policy rollout: scene 'Scene_ItemObtain' is not Scene_Map gameplay`
+     ——**agent 每次捡到东西都会当场停住**（观察到「获取道具时似乎会暂停 agent」）。
+     机制本身：`press_ok()` 只按 keymap 的确定键，有 `max_confirm_presses` 上限。
+     **真机实测（走完整条链）**：`before: scene=Scene_ItemObtain confirm=True` →
+     `press_ok -> True (35 ms)` → `after: scene=Scene_Map inGameplay=True`（一次 ok 即清）。
+     **同一个坑还暴露了另一个真缺陷**：`press_ok` 原先靠 `_pump_frames(1)` 让「按下」跨一帧，
+     而 **realtime（唯一用于实机自博弈的模式）里没有帧泵，它是 `return 0` 的空操作**——
+     于是 down/up 在同一毫秒发出、**游戏一帧都没看到按键**（日志里三次 ok 挤在 5 ms 内，
+     `Scene_ItemObtain` 三次都清不掉）。现在改为 `_hold_one_frame()`：有泵就泵一帧，
+     没泵就**按真实时间睡一帧**。**凡是「跨一帧」的假设，在 realtime 下必须用真实时间实现。**
+     **凡 ok 会在条目中选择的场景一律不得进入**（不管画面看起来多无害）。
      **反例（务必记住）**：`Scene_Transport` 曾被放进这个名单，理由是「它是游戏的过场
      画面、需要按一次确定」。它其实是**选择传送点的菜单**——ok 在那里就是选传送目标，
      于是 agent 选了它根本没选的落点、把角色扔到伤害陷阱上。这正是这道门槛存在的意义。
@@ -124,7 +158,32 @@
   **报告必须能说出「为什么」退化**：`logit_diagnosis()` 把 logits 拆成
   「每类随帧变化的幅度」（`logit_temporal_std`）与「类间偏置的跨度」
   （`logit_bias_spread`），比值 `bias_over_temporal ≥ 1` 就说明 argmax 由偏置决定、
-  与输入无关。实测过的真 IDM 是 0.008 vs 0.13（比值 ~16）；假后端那轮是 0.11~0.15 vs
+  与输入无关。
+  **`majority_share` 必须带上「是哪个类」与 noop 占比**（`majority_class` /
+  `majority_class_name` / `noop_share`）：同一个 0.6 的集中度，如果那个类是 `right`
+  就是「在学跑步」，如果是 `noop` 就是「在学站着不动」——**结论相反，而光看比例分不出来**。
+  实测（2026-09-25，观察到「agent 静止不动的时间更长了」）：
+  ```
+  0r2lVc1uKa0 (裁过的速通)  1999 帧 | noop 48.6%
+  BV19s4y1y7un(裁过的速通)  1999 帧 | noop 46.8%
+  house-002   (自己的录制)  1999 帧 | noop  2.7%
+  ```
+  ⇒ **π 的监督信号近一半是「不动」，所以它学成尽量不动**；而 `max_pseudo_majority=0.9`
+  拦不住它——那是个**偏斜**分布，不是常数分布。
+  **但这 50% 本身是 IDM 在分布外的默认答案**（核对过速通视频：按键基本没停过 →
+  真标签应接近 0% noop）。判据：IDM 在**自己那条 CDP 抓帧管线**的数据上很准
+  （人工回放逐类召回 92~96%、整体 91.6%；自己的录制上 noop 只 **2.2%**），
+  一到**视频抽帧**上就说 ~50% noop。根因与 K 匹配不上**同源**：视频帧经过缩放/重编码/色差。
+  - **帧间隔不是原因**（实测步长 1/2/3 的 noop 占比 50.9/51.1/51.8%，几乎不变）；
+    裁剪是**降低** noop 的（未裁 65.4% → 裁过 43.4%），所以裁剪不是元凶。
+  - **试过的修法：视频管线数据增强 → 实测失败，代码已删除**（2026-09-25）。
+    增强后 noop 从 43.4% **升到 91.9%**，而且**在同分布的录制上从 2.2% 升到 59.6%**——
+    那不是域适应，是把模型弄坏了：JPEG+缩放往返+色彩偏移一起上，把标签赖以判断的
+    细微运动差异一起毁掉，模型退化成「拿不准就答多数类」。
+    **不要再往这个方向试**（把训练输入退化到目标域并不等于域适应，这条已经付过一次代价）；
+    真要改 IDM 的域泛化，得换别的思路（例如在目标域上有真值、或改模型而非改输入）。
+  - **留下的结论**：可靠的 π 监督信号只能来自**自己录的 CDP 数据**（2.2% noop），
+    所以要靠**多录**（与 K 覆盖率是同一个杠杆：同一区域 3 段）。实测过的真 IDM 是 0.008 vs 0.13（比值 ~16）；假后端那轮是 0.11~0.15 vs
   0.55~0.67（比值 3.6~6.2）。这两个数字此前是**手写探针**跑了两次才拿到，
   现在每轮报告自带。
 
@@ -162,6 +221,18 @@
    犯过这个错误并据此得出过「引擎也会卡在 6」的**错误结论，已撤回**。
    另：旧项目的 `__vpt.restore()` **恢复不完整**（只回位置，不回 hp/`_pRealState`），
    不能靠它在两臂之间复位。
+
+## 现状（先读 `docs/status.md`）
+
+**管道全通、真机逐项验证过；阻塞在学习信号那一段。** 三条最容易误解的事实：
+
+1. **IDM 对语料的伪标签不可用，根因是跨场景不泛化**：训 3 个屋子录制 → 留出 `human-001`
+   准确率 **45.5%**（多数类基线 50.4%）；换冻结 DINOv2 + MLP 头仍然 **45.1%**。
+   而同场景内随机划分是 91.6% —— **之前的乐观数字来自这里**，评价 IDM 必须用跨场景留出。
+2. **任务本身有信号**（动作帧的画面变化是 noop 帧的 3~4 倍），重叠 74~78% → 天花板约 70~80%，
+   所以「不可学」不是解释，「模型没泛化」才是。
+3. **别重复已否证的假设**（帧间隔、颜色偏移、取景比例、视频管线增强、换编码器）——
+   `docs/status.md` 第二节逐条记着数字。
 
 ## 架构速览
 
@@ -249,11 +320,14 @@ uv sync
   runner 侧另钉死两条：解析成功则**继续该轮**（不中止），解析失败则**中止且一步都不走**。
   **菜单条目守卫**另钉死：可操作场景 + 安全条目 → **放行**；命中拒绝名单 → **拒绝**；
   条目读不到 → **拒绝**；非可操作菜单 → 仍只允许 cancel。并在 node 里加载**真实 agent.js**
-  逐项验证最后一栏五项（只有「返回城镇」放行）与物品分类放行。
+  逐项验证最后一栏五项（只有「返回城镇」放行）、物品分类放行、以及 GAME OVER 的
+  `CONTINUE_YES` 放行 / `CONTINUE_NO` 拒绝。
   **两个阶段的进度必须分开报**（`maps` 只统计策略阶段、`random_maps` 统计随机阶段）：
   反例（实测）——第一次多轮实跑三轮都显示 `maps [[4]]`，而角色**其实已经在随机阶段走到了
   map 5**；用来判断「它出去了吗」的那个指标，恰恰看不见它出去的那一段。
-- `tests/test_confirm_scenes.py`：`CONFIRM_SCENES` 为空，且传送菜单等菜单类不在其中。
+- `tests/test_confirm_scenes.py`：`CONFIRM_SCENES` **只许含被证明过的场景**（当前仅
+  `Scene_ItemObtain`，其 ok 被游戏绑定到 `popScene`），且传送菜单等菜单类**不在其中**；
+  另钉死若干「看起来像弹窗但没被证明」的场景名不得混进来。
 - `tests/test_time_scale.py`：`control_interval_s` 派生出的 agent 步长与语料抽帧率必须
   一致，CLI 不一致时拒绝启动。
 - `tests/test_pseudo_labels.py`：伪标签退化成常数时不得更新 π，且必须报告。
@@ -273,7 +347,7 @@ uv sync
 - `tests/test_pseudo_labels.py`：除「拒绝在常数目标上训 π」外，还钉死 `logit_diagnosis()`
   能把「偏置主导」与「输入驱动」分开，且这两个数字必须真的进报告。
 - `tests/test_menu_escape.py`：菜单逃生的边界。钉死：`MENU_SCENES` 与 `CONFIRM_SCENES`
-  **不相交**、`CONFIRM_SCENES` 仍为空、**只按 cancel**（记录实际派发的按键）、一到
+  **不相交**（`CONFIRM_SCENES` 现在恰好含 `Scene_ItemObtain`）、**只按 cancel**（记录实际派发的按键）、一到
   `Scene_Map` 立刻停手、`awaitingChoice`/未知场景**拒绝**、逃生失败**必须中止该轮**
   （不能落空派发游戏按键）、次数有上限。
 - `tests/test_action_space.py`：动作空间**只能追加**。钉死：`BUTTONS` 前 13 项的下标与

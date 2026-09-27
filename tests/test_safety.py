@@ -768,6 +768,10 @@ def test_the_shipped_agent_js_denies_the_whole_last_column_but_the_town():
         "  guarded: col.map(function (n) { return V.isGuardedEntry([{panel: '_systemPanel', name: n}]); }),"
         "  item_category: V.isGuardedEntry([{panel: '_itemPanel',"
         "                     name: 'STATIC_TEXT_MENU_ITEM_ORNAMENTS'}]),"
+        "  gameover_yes: V.isGuardedEntry([{panel: '_selectBox',"
+        "                     name: 'STATIC_TEXT_CONTINUE_YES'}]),"
+        "  gameover_no: V.isGuardedEntry([{panel: '_selectBox',"
+        "                     name: 'STATIC_TEXT_CONTINUE_NO'}]),"
         "  deny: V.MENU_ENTRY_DENY,"
         "  operable: V.OPERABLE_SCENES}));" % str(agent_js)
     )
@@ -779,6 +783,11 @@ def test_the_shipped_agent_js_denies_the_whole_last_column_but_the_town():
     assert "STATIC_TEXT_MENU_SYSTEM_BACK_TOWN" not in got["deny"], (
         "back to town is the one entry in that column the user allows")
     assert "Scene_Shop" in got["operable"], got
+    assert "Scene_Gameover" in got["operable"], got
+    # GAME OVER asks "continue?" with 读取存档 (YES) and 返回小镇 (NO); the operator
+    # allows only the first, so only the second may be denied.
+    assert got["gameover_yes"] is False, got
+    assert got["gameover_no"] is True, got
     # Only scenes the running game was SEEN to use are listed.  The classes
     # Scene_Item/Scene_Equip/Scene_Skill/Scene_Status do exist - enumerating
     # window.Scene_* shows them - but a screenshot of the menu showed items, orbs
@@ -787,3 +796,58 @@ def test_the_shipped_agent_js_denies_the_whole_last_column_but_the_town():
     # coverage without being any.
     for unobserved in ("Scene_Item", "Scene_Equip", "Scene_Skill", "Scene_Status"):
         assert unobserved not in got["operable"], unobserved
+
+
+GAMEOVER_SAVE = {"scene": "Scene_Gameover", "messageBusy": False, "inGameplay": False,
+                 "tickerRunning": True, "awaitingChoice": False, "menuOperable": True,
+                 "guardedMenuEntry": False,
+                 "menuEntries": [{"panel": "_selectBox", "index": "up",
+                                  "name": "STATIC_TEXT_CONTINUE_YES"}]}
+GAMEOVER_TOWN = dict(GAMEOVER_SAVE, guardedMenuEntry=True,
+                     menuEntries=[{"panel": "_selectBox", "index": "down",
+                                   "name": "STATIC_TEXT_CONTINUE_NO"}])
+
+
+def test_death_is_recoverable_by_loading_the_save():
+    """The game's own continue path, and the operator allows exactly that one.
+
+    Refusing the whole screen aborted every round the character died in, and the
+    trap in map 8 makes dying routine: it re-applies a 60-frame stagger every 30
+    frames, so the character never recovers, and once it dies the game skips the
+    teleport out (`!isDeath()`).
+    """
+    assert _env(GAMEOVER_SAVE).unsafe_reason() is None
+
+
+def test_the_game_over_screen_does_not_let_the_agent_return_to_town():
+    reason = _env(GAMEOVER_TOWN).unsafe_reason()
+    assert reason and "must not be committed" in reason
+
+
+def test_a_game_over_screen_with_an_unreadable_cursor_is_refused():
+    payload = dict(GAMEOVER_SAVE, menuEntries=[])
+    reason = _env(payload).unsafe_reason()
+    assert reason and "could not be read" in reason
+
+
+def test_an_ok_press_stays_down_across_a_real_frame():
+    """In realtime mode there is no pump, so the frame has to be real time.
+
+    `press_ok` relied on `_pump_frames(1)`, which returns 0 without a pump - and
+    live self-play is realtime by rule. A live run therefore logged three ok
+    presses five milliseconds apart and Scene_ItemObtain never cleared, because no
+    frame ever saw the key down.
+    """
+    import time as _time
+
+    payload = dict(MENU_SAFE, scene="Scene_ItemObtain", menuOperable=False, confirm=True)
+    env = _env(payload)
+    assert env._pump_installed is False, "realtime mode must not install the pump"
+    frame_ms = env.config.frame_ms
+
+    started = _time.perf_counter()
+    assert env.press_ok() is True
+    elapsed_ms = (_time.perf_counter() - started) * 1000.0
+
+    # Two frames: one with the key down, one with it up.
+    assert elapsed_ms >= 2 * frame_ms, elapsed_ms

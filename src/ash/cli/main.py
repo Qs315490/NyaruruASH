@@ -24,6 +24,8 @@ from typing import Any
 
 import numpy as np
 
+from ash.data.corpus_crop import CroppedFrames, load_crops
+
 log = logging.getLogger("ash")
 
 
@@ -223,7 +225,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # classify() on every 4th frame; the first bootstrap only runs after a whole
     # round of inference has finished, which is too late.
     index = _corpus_embeddings(args.corpus_index, args.corpus, embedder,
-                               args.recordings)
+                               args.recordings, args.corpus_crops)
     kdm = _key_moment_model(args, embedder, index)
 
     def runner(**kw):
@@ -280,7 +282,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                          max_policy_steps=args.policy_steps))
         return b.run(
             kw["policy"], kw["idm"], kw["kdm"], kw["trajectories"],
-            corpus_loader=_corpus_loader(args.corpus, args.recordings),
+            corpus_loader=_corpus_loader(args.corpus, args.recordings,
+                                         getattr(args, "corpus_crops", None)),
             out_dir=Path(kw["out_dir"]),
             # D^R from step 2.  Dropping it here made retrieval a no-op: the
             # bootstrap read the whole corpus and reported a plausible
@@ -419,7 +422,9 @@ def _kdm_fingerprint(args, kdm: Any, embedder: Any) -> str:
     return json.dumps(
         {
             "v": 1,
-            "corpus": _corpus_fingerprint(args.corpus, embedder.image_size, args.recordings),
+            "corpus": _corpus_fingerprint(args.corpus, embedder.image_size,
+                                          args.recordings,
+                                          getattr(args, "corpus_crops", None)),
             "params": kdm.hyperparameters(),
             "hdbscan": _dist_version("hdbscan"),
             "sklearn": getattr(sklearn, "__version__", _dist_version("scikit-learn")),
@@ -443,6 +448,7 @@ def _corpus_embeddings(
     corpus_dir: str | None,
     embedder: Any,
     recordings_dir: str | None = None,
+    crops_path: str | None = None,
 ) -> list[tuple[str, np.ndarray]]:
     """One L2-normalized embedding matrix per corpus video.
 
@@ -456,7 +462,8 @@ def _corpus_embeddings(
     """
     base = Path(corpus_dir or "data/corpus")
     cache = Path(path) if path else base.parent / (base.name + "-embeddings.npz")
-    stamp = _corpus_fingerprint(corpus_dir, embedder.image_size, recordings_dir)
+    stamp = _corpus_fingerprint(corpus_dir, embedder.image_size, recordings_dir,
+                                crops_path)
     if cache.exists():
         with np.load(cache, allow_pickle=False) as data:
             meta = data["__meta__"] if "__meta__" in data.files else None
@@ -469,7 +476,7 @@ def _corpus_embeddings(
             # reusing it.
             log.warning("retrieval index cache %s is stale or unversioned; rebuilding", cache)
     out: list[tuple[str, np.ndarray]] = []
-    for vid, frames in _corpus_loader(corpus_dir, recordings_dir)():
+    for vid, frames in _corpus_loader(corpus_dir, recordings_dir, crops_path)():
         if len(frames):
             out.append((vid, embedder.embed(frames)))
     if out:
@@ -510,7 +517,8 @@ def _corpus_dirs(corpus_dir: str | None, recordings_dir: str | None = None) -> l
 
 
 def _corpus_fingerprint(corpus_dir: str | None, image_size: int,
-                        recordings_dir: str | None = None) -> str:
+                        recordings_dir: str | None = None,
+                        crops_path: str | None = None) -> str:
     """Cheap identity of the corpus + embedding resolution, for the cache.
 
     Uses file names and sizes rather than loading the frames: the point is to
@@ -528,11 +536,20 @@ def _corpus_fingerprint(corpus_dir: str | None, image_size: int,
         for path in sorted(base.glob("*.npz")) + sorted(base.glob("*.npy")):
             files.append((str(path), path.stat().st_size))
     files.sort()
-    return json.dumps({"v": 1, "image_size": int(image_size), "files": files},
-                      sort_keys=True)
+    # The crop is part of what the frames MEAN, so it belongs in the identity of
+    # the embeddings.  A fingerprint without it would reuse an index built from
+    # uncropped frames after the crops changed, silently - the same failure the
+    # `.npz`-only glob caused.
+    try:
+        crops = Path(crops_path).read_text() if crops_path else ""
+    except OSError:
+        crops = ""
+    return json.dumps({"v": 2, "image_size": int(image_size), "files": files,
+                       "crops": crops}, sort_keys=True)
 
 
-def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None):
+def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None,
+                   crops_path: str | None = None):
     """Yield (video_id, frames) for the corpus, optionally restricted to D^R.
 
     `ids=None` means the whole corpus D^I (used to fit K and to build the
@@ -547,6 +564,10 @@ def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None):
     #: to the nearest corpus frame, no corpus frame was within 0.95 of any live
     #: frame, and `key_moments` was 0 in every single round.
     bases = _corpus_dirs(corpus_dir, recordings_dir)
+    # Scraped videos carry a splits panel, a banner and black bars; the crop found
+    # by `scripts/detect_game_rect.py` removes them and restores the live window's
+    # aspect.  Applied on access so the mmap stays an mmap.
+    crops = load_crops(crops_path)
 
     def load(ids: list[str] | None = None):
         want = None if ids is None else set(ids)
@@ -566,7 +587,8 @@ def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None):
             # it cannot, and materializing 2.6 GB of it stalled a round in swap.
             packed = base / f"{stem}.npy"
             if packed.exists():
-                yield stem, np.load(packed, mmap_mode="r")
+                frames = np.load(packed, mmap_mode="r")
+                yield stem, CroppedFrames(frames, crops[stem]) if stem in crops else frames
                 continue
             with np.load(base / f"{stem}.npz") as data:
                 # `frames` is a scraped video, `observations` a recorded session;
@@ -574,7 +596,8 @@ def _corpus_loader(corpus_dir: str | None, recordings_dir: str | None = None):
                 key = "frames"
                 if key not in data.files:
                     key = "observations"
-                yield stem, data[key]
+                frames = data[key]
+                yield stem, CroppedFrames(frames, crops[stem]) if stem in crops else frames
     return load
 
 
@@ -725,13 +748,17 @@ def cmd_pretrain_idm(args: argparse.Namespace) -> int:
     from ash.actions.space import ActionSpace
     from ash.loop.bootstrap import BootstrapConfig, Bootstrapper
     from ash.models.idm import IdmConfig, IdmModel, save_idm
-    from ash.train.demo_mapping import map_legacy_masks
+    from ash.train.demo_mapping import load_demo, map_legacy_masks
 
     space = ActionSpace.minimal()
-    with np.load(args.demos, allow_pickle=False) as data:
-        obs = data["observations"]
-        masks = data["control_masks"]
-        episodes = data["episode_ids"]
+    # `load_demo`, not `np.load`: the same demonstrations exist as an npz and as a
+    # packed directory of mmaps, and the other callers already accept both.  Going
+    # straight to np.load meant `--demos data/idm-human.npz` failed here once the
+    # npz was packed away, while `--idm-replay` with the same path kept working.
+    data = load_demo(args.demos)
+    obs = data["observations"]
+    masks = data["control_masks"]
+    episodes = data["episode_ids"]
     # 0 (the default) infers from the recorded frames.  Exposed because the two
     # sources are stored at different native sizes - the 2019-era sessions at 128,
     # a fresh recording at 256 - and whether the extra pixels pay for themselves
@@ -803,6 +830,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--idm-replay-steps", type=int, default=4000,
                    help="demonstration transitions replayed per round")
     r.add_argument("--corpus", default="data/corpus", help="internet video corpus dir")
+    r.add_argument("--corpus-crops", default="data/corpus-crops.json",
+                   help="crop rects for scraped corpus frames (game viewport only)")
     r.add_argument("--recordings", default="data/recordings",
                    help="dir of recorded human sessions to add to D^I (K coverage)")
     r.add_argument("--corpus-index", default=None, help="precomputed embedding index json")

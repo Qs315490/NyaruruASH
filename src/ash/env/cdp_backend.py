@@ -1524,11 +1524,30 @@ class CdpSpeedrunEnv:
         # DOWN across a frame and released on a later one.  Dispatching down and
         # up back-to-back lets every frame see an idle keyboard and the confirm
         # edge never registers - the same ordering bug step_frame documents.
-        self._pump_frames(1)
+        self._hold_one_frame()
         for binding in self._bindings_for(mask):
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
-        self._pump_frames(1)
+        # The release gets a frame of its own too, so the next press is a fresh
+        # edge rather than a continuation of this one.
+        self._hold_one_frame()
         return True
+
+    def _hold_one_frame(self) -> None:
+        """Leave a key DOWN across a frame the game actually runs.
+
+        The engine samples input on the frames it runs, so a key has to be down
+        across one.  In pump mode a pump advances that frame; in realtime mode -
+        the only mode live self-play uses (AGENTS.md rule 9) - the engine runs on
+        its own clock, so the wait has to be real time and `_pump_frames` is a
+        no-op.  `press_ok` relied on the pump anyway, which dispatched keydown and
+        keyup in the same millisecond: a live run logged three ok presses five
+        milliseconds apart and `Scene_ItemObtain` never cleared, because no frame
+        ever saw the key down.
+        """
+        if self._pump_installed:
+            self._pump_frames(1)
+            return
+        time.sleep(self.config.frame_ms / 1000.0)
 
     def _pump_frames(self, count: int) -> int:
         """Advance `count` game frames without pressing anything."""

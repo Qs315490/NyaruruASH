@@ -185,3 +185,46 @@ def test_report_carries_the_logit_diagnosis(tmp_path):
     assert "logit_temporal_std" in stats and "logit_bias_spread" in stats
     # _ConstantIdm returns a hard-coded vector: zero temporal movement.
     assert stats["logit_temporal_std"] == 0.0
+
+
+def test_the_report_says_which_class_dominates():
+    """`majority_share` alone cannot separate the two failure directions.
+
+    A corpus labelled 60% one class is being taught to RUN if that class is
+    "right" and to STAND STILL if it is noop - opposite conclusions from the same
+    number. The user watched the agent idle and asked why; the report has to be
+    able to answer.
+    """
+    import numpy as np
+
+    from ash.loop.bootstrap import action_names, pseudo_label_stats
+
+    names = action_names(20)
+    actions = np.zeros((3, 4, 20), dtype=np.float32)
+    actions[0, 1:, 0] = 1.0        # one window of noop
+    actions[1:, 1:, 2] = 1.0       # two windows of "right"
+
+    stats = pseudo_label_stats({"actions": actions}, 20, names)
+
+    assert stats["majority_class"] == 2
+    assert stats["majority_class_name"] == "right", stats
+    assert stats["majority_share"] > stats["noop_share"]
+
+    idle = np.zeros((1, 3, 20), dtype=np.float32)
+    idle[:, 1:, 0] = 1.0
+    idle_stats = pseudo_label_stats({"actions": idle}, 20, names)
+    assert idle_stats["majority_class_name"] == "noop"
+    assert idle_stats["noop_share"] == 1.0
+
+
+def test_the_class_name_survives_a_missing_name_list():
+    """The name is a convenience; an unidentified class must not break a round."""
+    import numpy as np
+
+    from ash.loop.bootstrap import pseudo_label_stats
+
+    actions = np.zeros((1, 3, 20), dtype=np.float32)
+    actions[:, 1:, 5] = 1.0
+    stats = pseudo_label_stats({"actions": actions}, 20)
+    assert stats["majority_class"] == 5
+    assert "majority_class_name" not in stats

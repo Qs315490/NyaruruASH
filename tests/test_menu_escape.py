@@ -45,7 +45,9 @@ def _lists() -> dict:
 def test_menu_and_confirm_lists_are_disjoint():
     """ok-safe and cancel-safe are different questions and must not be merged."""
     lists = _lists()
-    assert lists["confirm"] == [], "nothing is proven safe to press ok on"
+    # An entry now exists - Scene_ItemObtain, whose ok the game binds to popScene -
+    # but the two lists answer different questions and still must not overlap.
+    assert lists["confirm"] == ["Scene_ItemObtain"], lists["confirm"]
     assert not set(lists["menu"]) & set(lists["confirm"])
     assert "Scene_SkillSt" in lists["menu"], "this is the scene that trapped a real round"
 
