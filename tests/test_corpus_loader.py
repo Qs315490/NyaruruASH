@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 
 import numpy as np
-import pytest
 
 from ash.cli.main import _corpus_loader
 
@@ -98,3 +97,28 @@ def test_the_fingerprint_sees_packed_files_and_recordings(tmp_path):
     np.save(recs / "human-001.npy", np.zeros((2, 4, 4, 3), dtype=np.uint8))
     after = _corpus_fingerprint(str(corpus), 128, str(recs))
     assert after != before, "adding a recording must invalidate the cached index"
+
+
+def test_the_embedding_pass_releases_its_gpu_cache(tmp_path, monkeypatch):
+    """A long embed pass must not starve the round that follows it.
+
+    `live26` rebuilt the retrieval index (16 minutes of DINOv2 over the whole
+    corpus) and then died in the bootstrap's first pi update with
+    `CUDA error: out of memory`.  `live25`, same settings but with the index
+    already cached and no long embed pass, ran to completion - so the pass is
+    what leaves the allocator unusable.
+    """
+    import torch
+
+    from ash.cli.main import _release_device_cache
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    _release_device_cache()
+    assert calls, "the embed pass must release its cached blocks"
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    calls.clear()
+    _release_device_cache()
+    assert not calls, "no CUDA: nothing to release, and no crash"

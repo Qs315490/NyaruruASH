@@ -31,8 +31,8 @@ import numpy as np
 import torch
 
 from ash.actions.space import ActionSpace
-from ash.models.ash_policy import AshPolicy
 from ash.memory.kdm import KeyMomentModel
+from ash.models.ash_policy import AshPolicy
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +103,10 @@ class InferenceRunner:
         #: keeps reappearing is a loop, and a round must end rather than spin.
         max_menu_escapes: int = 8,
         max_menu_presses: int = 4,
+        #: How many times one round may answer a guarded difficulty pick with the
+        #: operator's preset.  Small: the pick appears once, and a dialogue that
+        #: keeps asking is a loop the round must end on rather than spin in.
+        max_difficulty_resolves: int = 3,
         frame_skip: int = 1,
         max_confirm_presses: int = 3,
     ) -> None:
@@ -131,13 +135,14 @@ class InferenceRunner:
         # frame re-classifies as "new" and the stuck timer never advances.
         self.key_moment_cooldown = key_moment_cooldown
         self.max_menu_escapes = max(0, int(max_menu_escapes))
+        self.max_difficulty_resolves = max(0, int(max_difficulty_resolves))
         self.max_menu_presses = max(1, int(max_menu_presses))
 
     # ------------------------------------------------------------------
 
     @staticmethod
     def _scene_gate(envs: list[Any]) -> tuple[str, str | None]:
-        """Classify the current scene: "ok", "confirm", "menu" or "abort".
+        """Classify: "ok", "confirm", "menu", "difficulty" or "abort".
 
         Backends that do not implement the hook (the fake one) are always "ok".
         The CDP backend implements it and fails closed on an unreadable scene,
@@ -156,11 +161,41 @@ class InferenceRunner:
             reason = check()
             if not reason:
                 continue
+            # The difficulty pick is a choice this layer must not answer by
+            # accident, but it also cannot be left unanswered: the dialogue does
+            # not close any other way, so refusing parked the game there and
+            # aborted every round that reached it.  When the operator preset an
+            # answer, the backend may give exactly that one.
+            probe = getattr(env, "difficulty_choice_pending", None)
+            if probe is not None and probe():
+                return "difficulty", reason
             probe = getattr(env, "is_confirm_scene", None)
             if probe is not None and probe():
                 return "confirm", reason
             return "menu" if _is_menu_scene(env) else "abort", reason
         return "ok", None
+
+    @staticmethod
+    def _resolve_difficulty(envs: list[Any]) -> bool:
+        """Answer a guarded difficulty pick with the operator's preset option.
+
+        Returns True only when the backend verified that the choice is gone.
+        A failure returns False and the caller aborts: falling through would
+        dispatch gameplay keys into a live dialogue, which is the exact thing the
+        gate exists to prevent.
+        """
+        for env in envs:
+            resolve = getattr(env, "resolve_difficulty", None)
+            if resolve is None:
+                continue
+            out = resolve()
+            if out.get("resolved"):
+                log.info("difficulty: chose option %s in %s presses",
+                         out.get("option"), out.get("presses"))
+                return True
+            log.error("difficulty: could not answer the guarded pick: %s",
+                      out.get("reason"))
+        return False
 
     @staticmethod
     def _frame(result: Any) -> np.ndarray:
@@ -235,13 +270,27 @@ class InferenceRunner:
         random keystrokes on a menu screen are still menu selections.
         """
         rng = np.random.default_rng(int(seed))
+        # Sampled here too, and reported separately.  The policy round's `maps`
+        # only sees the policy phase, and the first multi-round run therefore
+        # reported `maps [[4]]` for every round while the character had actually
+        # walked out to map 5 during a random rollout - a measurement that hid
+        # the very thing it was being read to decide.
+        maps: list[int] = []
         obs = self._frame(env.reset())
         frames = [obs]
         acts: list[int] = []
         confirms = 0
         menu_escapes = 0
+        difficulty_resolves = 0
         for _ in range(max(0, int(steps))):
             kind, reason = self._scene_gate([env])
+            if kind == "difficulty":
+                if (difficulty_resolves < self.max_difficulty_resolves
+                        and self._resolve_difficulty([env])):
+                    difficulty_resolves += 1
+                    continue
+                log.error("aborting random-policy rollout: %s", reason)
+                break
             if kind == "menu":
                 if self._leave_menu([env], menu_escapes):
                     menu_escapes += 1
@@ -265,7 +314,12 @@ class InferenceRunner:
             obs = self._frame(env.step(self.action_space.mask_at(idx), frames=self.frame_skip))
             frames.append(obs)
             acts.append(idx)
-        return {"obs": np.asarray(frames), "act": np.asarray(acts, dtype=np.int64)}
+            if len(frames) % 10 == 0:
+                map_id = self._read_map(env)
+                if map_id is not None and (not maps or maps[-1] != map_id):
+                    maps.append(map_id)
+        return {"obs": np.asarray(frames), "act": np.asarray(acts, dtype=np.int64),
+                "maps": maps}
 
     def run(
         self,
@@ -286,12 +340,21 @@ class InferenceRunner:
         abort_reason: str | None = None
         confirms = 0
         menu_escapes = 0
+        difficulty_resolves = 0
         while not stuck_seen and time.time() - started < timeout_s:
             # Safety gate, before a single key is dispatched.  In RPG Maker the
             # ok/cancel keys ARE the policy's jump/attack keys, so acting on a
             # title or menu screen commits menu selections: an unattended run
             # pressed Z on the title screen and loaded the player's save.
             kind, reason = self._scene_gate(envs)
+            if kind == "difficulty":
+                if (difficulty_resolves < self.max_difficulty_resolves
+                        and self._resolve_difficulty(envs)):
+                    difficulty_resolves += 1
+                    continue
+                abort_reason = reason
+                log.error("aborting inference round: %s", abort_reason)
+                break
             if kind == "menu":
                 if self._leave_menu(envs, menu_escapes):
                     menu_escapes += 1
@@ -371,11 +434,15 @@ class InferenceRunner:
         # samples; without them the IDM only sees what the current policy
         # happened to do and cannot label unseen dynamics.
         random_trajectories: list[dict] = []
+        random_maps: list[int] = []
         if random_steps > 0 and not abort_reason:
             for env in envs:
                 traj = self.random_rollout(env, random_steps, random_seed)
                 if len(traj["act"]):
                     random_trajectories.append(traj)
+                for map_id in traj.get("maps") or []:
+                    if not random_maps or random_maps[-1] != map_id:
+                        random_maps.append(map_id)
             log.info(
                 "random-policy rollout: %d transitions",
                 sum(len(t["act"]) for t in random_trajectories),
@@ -393,6 +460,9 @@ class InferenceRunner:
             ],
             "random_trajectories": random_trajectories,
             "maps": [list(s.maps) for s in states],
+            # Kept apart from `maps` on purpose: "the policy walked there" and
+            # "random exploration happened to walk there" are different results.
+            "random_maps": random_maps,
             "memories": [list(s.memory) for s in states],
             "key_stats": [
                 {"evals": s.k_evals, "noise": s.k_noise,
@@ -407,22 +477,27 @@ class InferenceRunner:
             "aborted": abort_reason,
         }
 
-    def _sample_map(self, env: Any, state: AgentState) -> None:
-        """Record the current map id, when the backend can report one.
+    @staticmethod
+    def _read_map(env: Any) -> int | None:
+        """The current map id, or None when the backend cannot report one.
 
         Best-effort on purpose: the loop must not depend on a diagnostic, and a
         backend without state() simply reports nothing.
         """
         read = getattr(env, "state", None)
         if read is None:
-            return
+            return None
         try:
             player = (read() or {}).get("player") or {}
         except Exception:  # noqa: BLE001 - a diagnostic must never fail a round
-            return
+            return None
         map_id = player.get("mapId")
+        return None if map_id is None else int(map_id)
+
+    def _sample_map(self, env: Any, state: AgentState) -> None:
+        map_id = self._read_map(env)
         if map_id is not None and (not state.maps or state.maps[-1] != map_id):
-            state.maps.append(int(map_id))
+            state.maps.append(map_id)
 
     def _leave_menu(self, envs: list[Any], escapes: int) -> bool:
         """Try the cancel-only menu escape.  True when gameplay is reached.
@@ -441,8 +516,14 @@ class InferenceRunner:
             except Exception as exc:  # noqa: BLE001 - a failed escape aborts the round
                 log.error("menu escape failed: %s", str(exc)[:160])
                 return False
-            log.warning("escaped a menu with %d cancel press(es): %s",
-                        result.get("presses"), result.get("scene"))
+            # Log what happened, not what was attempted: this line used to say
+            # "escaped" whether or not it had, so a shop the agent could not leave
+            # looked like a shop it left and then re-entered.
+            if result.get("escaped"):
+                log.warning("escaped a menu with %d cancel press(es)", result.get("presses"))
+            else:
+                log.warning("menu escape did not clear the scene after %d press(es): %s",
+                            result.get("presses"), result.get("reason") or result.get("scene"))
             return bool(result.get("escaped"))
         return False
 

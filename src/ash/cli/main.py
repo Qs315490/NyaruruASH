@@ -68,7 +68,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _make_env(backend: str):
+def _make_env(backend: str, difficulty=None):
     """Construct a backend, capturing at the embedder's canonical frame size.
 
     The CDP backend defaults to a 128x128 capture, but the corpus is extracted
@@ -91,6 +91,7 @@ def _make_env(backend: str):
             backend,
             resize=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
             drive="realtime",
+            difficulty=difficulty,
         )
     return make_env(backend)
 
@@ -155,6 +156,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("语料与 agent 时间尺度不一致，拒绝启动：\n  %s" % mismatch, file=sys.stderr)
         return 4
 
+    # The difficulty pick is answered from the config unless the operator says
+    # otherwise; "off" refuses it, which parks the game on that screen because
+    # the pick has no cancel, so it is only ever the deliberate choice.
+    difficulty = args.difficulty if args.difficulty is not None else game.difficulty_preset
+    if str(difficulty).strip().lower() in {"", "off", "none"}:
+        difficulty = None
+        log.info("difficulty pick: refusing it (a round that reaches it will abort)")
+    else:
+        log.info("difficulty pick: will be answered with %r", difficulty)
+
     # The action space is the single source of truth for every action-shaped
     # tensor: the policy head width, the IDM head width and the index->mask
     # mapping must all agree on it.  Deriving them here (rather than letting
@@ -216,7 +227,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     kdm = _key_moment_model(args, embedder, index)
 
     def runner(**kw):
-        envs = [_make_env(args.backend) for _ in range(args.num_agents)]
+        envs = [_make_env(args.backend, difficulty) for _ in range(args.num_agents)]
         try:
             r = InferenceRunner(
                 lambda: envs[0], policy, kdm,
@@ -464,7 +475,22 @@ def _corpus_embeddings(
     if out:
         np.savez_compressed(cache, __meta__=np.array(stamp), **dict(out))
         log.info("wrote retrieval index to %s (%d videos)", cache, len(out))
+    # Hand the embedder's cached blocks back before the round starts.  Embedding
+    # the whole corpus is the longest GPU phase of a fresh run, and leaving its
+    # allocation cached cost a live round: `live26` rebuilt the index for 16
+    # minutes and then died in the bootstrap's first pi update with
+    # `CUDA error: out of memory`, while `live25` - same settings, index already
+    # cached, so no long embed pass - ran to completion.
+    _release_device_cache()
     return out
+
+
+def _release_device_cache() -> None:
+    """Return cached GPU blocks to the driver; no-op without CUDA."""
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _corpus_dirs(corpus_dir: str | None, recordings_dir: str | None = None) -> list[Path]:
@@ -706,7 +732,11 @@ def cmd_pretrain_idm(args: argparse.Namespace) -> int:
         obs = data["observations"]
         masks = data["control_masks"]
         episodes = data["episode_ids"]
-    image_size = int(obs.shape[1])
+    # 0 (the default) infers from the recorded frames.  Exposed because the two
+    # sources are stored at different native sizes - the 2019-era sessions at 128,
+    # a fresh recording at 256 - and whether the extra pixels pay for themselves
+    # is a measurement, not an opinion.
+    image_size = int(args.image_size or obs.shape[1])
     index, mapping = map_legacy_masks(masks, space)
     log.info("demo mapping: %d frames, %d distinct masks, %d exact, %d snapped, "
              "%d frames whose only presses were dropped keys",
@@ -764,6 +794,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--idm", default=None, help="existing IDM checkpoint")
     r.add_argument("--idm-replay", default=None,
                    help="recorded human demonstrations to replay into every IDM update")
+    r.add_argument("--difficulty", default=None,
+                   help="answer for the difficulty pick: the option text or a "
+                        "1-based number, 'off' to refuse it; default is "
+                        "config/game.yaml's difficulty_preset")
     r.add_argument("--policy-steps", type=int, default=300,
                    help="cap on pi optimizer steps per round (0 = unbounded)")
     r.add_argument("--idm-replay-steps", type=int, default=4000,
@@ -815,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--epochs", type=int, default=6)
     b.add_argument("--batch-size", type=int, default=64)
     b.add_argument("--lr", type=float, default=3e-4)
+    b.add_argument("--image-size", type=int, default=0,
+                   help="0 = use the recorded resolution")
     b.add_argument("--device", default=None)
     b.set_defaults(fn=cmd_pretrain_idm)
 

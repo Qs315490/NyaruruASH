@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -117,6 +118,10 @@ class Orchestrator:
                 # nothing it was: all noise, or all one already-seen cluster.
                 "key_stats": result.get("key_stats"),
                 "maps": result.get("maps"),
+                # The random phase's maps, reported separately from the policy
+                # phase's: conflating them made a run that walked out of the room
+                # look like one that never left.
+                "random_maps": result.get("random_maps"),
                 # How close the round's own frames got to the corpus.  Corpus
                 # frames sit ~0.93 cosine from their nearest corpus frame; a live
                 # view far below that is out of distribution, and no threshold or

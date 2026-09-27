@@ -63,6 +63,15 @@ class GameConfig:
     #: 0.25 s for the environment timestep AND for the corpus, so both sides are
     #: derived from this number now (see control_frame_skip and corpus_fps).
     control_interval_s: float = 0.25
+    #: The option the difficulty pick is answered with, as the game's own option
+    #: text or a 1-based number; empty means refuse it (the round aborts there).
+    #:
+    #: The pick cannot be closed any other way - it has no cancel - so refusing it
+    #: parks the game on that screen.  Easy is the default because the corpus is
+    #: speedruns, which are all easy: training on easy runs while the agent plays
+    #: another difficulty would compare two different games.  Per-difficulty
+    #: training means changing this, not mixing them.
+    difficulty_preset: str = ""
     keymap: dict[str, KeyBinding] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -101,6 +110,7 @@ def load_game_config(path: str | Path | None = None) -> GameConfig:
         window=data.get("window", {}) or {},
         fps=int(data.get("fps", 60)),
         control_interval_s=float(data.get("control_interval_s", 0.25)),
+        difficulty_preset=str(data.get("difficulty_preset", "") or "").strip(),
         keymap=keymap,
         raw=data,
     )

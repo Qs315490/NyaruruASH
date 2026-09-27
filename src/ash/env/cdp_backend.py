@@ -75,7 +75,13 @@ class CdpSpeedrunEnv:
         auto_connect: bool = True,
         enforce_safety: bool = True,
         drive: str = "pump",
+        difficulty: str | int | None = None,
     ) -> None:
+        #: The option the operator preset for the difficulty pick, as an index,
+        #: a 1-based number, or a substring of the option text.  None refuses the
+        #: pick (the round aborts there) - answering it is the operator's call,
+        #: never this layer's, so it only ever happens when asked for.
+        self.difficulty_option = difficulty
         #: How frames get advanced.
         #:
         #: "pump"     - the agent takes the ticker and advances frames by hand.
@@ -363,23 +369,31 @@ class CdpSpeedrunEnv:
             if self.config.keymap.get(b) and self.config.keymap[b].names
         ]
 
-    def _check_safe(self, *, escape: bool = False) -> None:
+    def _check_safe(self, *, escape: bool = False, difficulty: bool = False) -> None:
         """Refuse to touch the keyboard outside Scene_Map gameplay.
 
         The runner asks unsafe_reason() before it acts, but this is the
         backstop: no caller, however written, gets to press gameplay keys on a
         title or menu screen, where those same keys mean "confirm".
 
-        `escape=True` is the ONE other mode, and it is not a bypass: the gate is
-        still the gate, and in this mode it permits exactly one thing - the
-        cancel button, on a scene that agent.js lists as a menu, when no choice
-        is pending - which is what menu_escape_reason() checks.  Everything else
-        still fails here, and enforce_safety=False still switches the whole gate
-        off for diagnostic probes.
+        `escape=True` and `difficulty=True` are the two narrow modes, and neither
+        is a bypass: the gate is still the gate.  `escape` permits exactly one
+        thing - the cancel button, on a scene agent.js lists as a menu, with no
+        choice pending (menu_escape_reason).  `difficulty` permits navigating and
+        confirming exactly one thing - the difficulty pick the operator preset -
+        and refuses any choice that is not that one (difficulty_reason), so it can
+        never become a way to answer arbitrary dialogue.  Everything else still
+        fails here, and enforce_safety=False still switches the whole gate off for
+        diagnostic probes.
         """
         if not self.enforce_safety:
             return
-        reason = self.menu_escape_reason() if escape else self.unsafe_reason()
+        if escape:
+            reason = self.menu_escape_reason()
+        elif difficulty:
+            reason = self.difficulty_reason()
+        else:
+            reason = self.unsafe_reason()
         if reason:
             raise UnsafeSceneError("refusing to dispatch input: %s" % reason)
 
@@ -427,6 +441,159 @@ class CdpSpeedrunEnv:
         for binding in bindings:
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
 
+    def _poll_safety(self, predicate, *, tries: int = 8) -> dict:
+        """Read safety until `predicate` holds, bounded by `tries` frames.
+
+        A scene change is not visible on the frame the key is released: MZ runs
+        the transition over the next few frames.  Reading once and concluding
+        "it did not work" is what made the menu escape report failure while the
+        game was in fact leaving - verified by the scene being Scene_Map again
+        moments after the escape gave up.
+        """
+        info = self.safety() or {}
+        for _ in range(max(0, int(tries) - 1)):
+            if predicate(info):
+                return info
+            time.sleep(self.config.frame_ms / 1000.0)
+            info = self.safety() or {}
+        return info
+
+    def _between_presses(self) -> None:
+        """Hold the key UP for at least one sampled frame before pressing again.
+
+        The game reads its input once per 60 Hz frame and MZ triggers on a
+        transition, so a release shorter than a frame is never seen: four cancels
+        dispatched back to back registered as at most one.  That is why the agent
+        sat in Scene_Shop after "four" cancel presses while a human exits it with
+        one - the presses were being sent, not observed.
+        """
+        # Two frames: one to sample the release, one of margin for the round trip
+        # that reads the scene back in between.
+        time.sleep(2.0 * self.config.frame_ms / 1000.0)
+
+    def difficulty_choice_pending(self) -> bool:
+        """True when the awaiting choice is the guarded (difficulty) pick."""
+        try:
+            info = self.safety() or {}
+        except CdpError:
+            return False
+        return bool(info.get("awaitingChoice") and info.get("guardedChoice"))
+
+    def _difficulty_objection(self, info: dict | None) -> str | None:
+        """The shared verdict for one safety read; None when a resolve may run."""
+        if self.difficulty_option is None:
+            return "no difficulty preset configured (--difficulty)"
+        if not info:
+            return "safety probe unavailable: agent.js not installed"
+        if not info.get("awaitingChoice"):
+            return "no choice is awaiting an answer"
+        if not info.get("guardedChoice"):
+            return "the awaiting choice is not the guarded difficulty pick"
+        if not info.get("inGameplay"):
+            return "scene %r is not Scene_Map gameplay" % (info.get("scene"),)
+        if self.drive == "realtime" and not info.get("tickerRunning"):
+            return "the engine's ticker is not running"
+        return None
+
+    def difficulty_reason(self) -> str | None:
+        """None when the preset difficulty may be answered on the agent's behalf.
+
+        Narrower than every other input path in this class: a *guarded* choice is
+        awaiting (agent.js's difficulty denylist), the operator configured a
+        preset, the scene is Scene_Map, and the engine is running.  A choice that
+        is not guarded is refused here, so this can never become a way to answer
+        arbitrary dialogue - that is what `unsafe_reason` is for.
+        """
+        if self.difficulty_option is None:
+            return "no difficulty preset configured (--difficulty)"
+        try:
+            info = self.safety()
+        except CdpError as exc:
+            return "safety probe failed (%s)" % (str(exc)[:120],)
+        return self._difficulty_objection(info)
+
+    def _choice_index_for_option(self, texts: list[str]) -> int | None:
+        """Which option the preset names: a 1-based number, or a substring of the text.
+
+        The texts are the *sanitised* ones agent.js reports, so the difficulty
+        option that carries a colour code is matchable like any other.
+        """
+        want = self.difficulty_option
+        if want is None:
+            return None
+        if isinstance(want, bool) or not isinstance(want, (int, str)):
+            return None
+        if isinstance(want, int):
+            i = want - 1               # options are numbered from 1, everywhere
+            return i if 0 <= i < len(texts) else None
+        text = str(want)
+        if text.isdigit():
+            i = int(text) - 1          # and a number on the command line means the same
+            return i if 0 <= i < len(texts) else None
+        for i, option in enumerate(texts):
+            if text and text in option:
+                return i
+        return None
+
+    def resolve_difficulty(self, *, max_presses: int = 8) -> dict[str, Any]:
+        """Answer the difficulty pick with the operator's preset option.
+
+        Returns {"resolved", "presses", "option", "reason"}.  This is the only
+        path that answers a dialogue choice, and it is deliberately narrow: the
+        choice must be classified as guarded, the target is the option the
+        operator named, the presses are bounded, and success is *verified* by
+        re-reading whether a choice is still waiting rather than assumed.
+        """
+        out: dict[str, Any] = {"resolved": False, "presses": 0, "option": None,
+                               "reason": None}
+        # One read for both the verdict and the option texts: two reads could see
+        # two different dialogues, and the second one is what would be answered.
+        try:
+            info = self.safety()
+        except CdpError as exc:
+            out["reason"] = "safety probe failed (%s)" % (str(exc)[:120],)
+            return out
+        reason = self._difficulty_objection(info)
+        if reason:
+            out["reason"] = reason
+            return out
+        texts = list((info or {}).get("choiceTexts") or [])
+        index = self._choice_index_for_option(texts)
+        if index is None:
+            out["reason"] = ("the preset %r matches none of the options %r"
+                             % (self.difficulty_option, texts))
+            return out
+        out["option"] = index
+        current = info.get("choiceIndex")
+        if not isinstance(current, int):
+            out["reason"] = "the highlighted option could not be read"
+            return out
+        try:
+            down = mask_from_buttons(["down"])
+            up = mask_from_buttons(["up"])
+            ok = self._confirm_mask()
+        except CdpError as exc:
+            out["reason"] = str(exc)
+            return out
+        delta = index - current
+        binding = down if delta > 0 else up
+        for _ in range(min(abs(delta), max(0, int(max_presses)))):
+            self._check_safe(difficulty=True)     # the gate, in its narrow mode
+            self._dispatch(binding)
+            self._between_presses()
+            out["presses"] += 1
+        self._check_safe(difficulty=True)
+        self._dispatch(ok)
+        self._between_presses()
+        out["presses"] += 1
+        after = self._poll_safety(lambda i: not i.get("awaitingChoice"))
+        if after.get("awaitingChoice"):
+            out["reason"] = ("the choice is still waiting after %d presses"
+                             % out["presses"])
+            return out
+        out["resolved"] = True
+        return out
+
     def escape_menu(self, *, max_presses: int = 4) -> dict[str, Any]:
         """Press ONLY cancel, at most `max_presses` times, to back out to gameplay.
 
@@ -452,7 +619,8 @@ class CdpSpeedrunEnv:
             self._check_safe(escape=True)      # the gate, in its narrow mode
             out["presses"] += 1
             self._dispatch(mask)
-            info = self.safety() or {}
+            self._between_presses()
+            info = self._poll_safety(lambda i: i.get("inGameplay"))
             out["scene"] = info.get("scene")
             if info.get("inGameplay"):
                 out["escaped"] = True
@@ -1269,13 +1437,21 @@ class CdpSpeedrunEnv:
         if not info:
             return "safety probe unavailable: agent.js not installed"
         if info.get("awaitingChoice"):
-            # A choice is a decision, and ok answers it.  The scene being
-            # Scene_Map does not make this safe: the policy's jump key IS the
-            # ok key, so free input would pick whichever option is highlighted -
-            # a difficulty setting, a yes/no, a destination.  Refusing here is
-            # the whole point; the choice must be made deliberately, never by
-            # the layer whose only job is to say whether input is allowed.
-            return "a dialogue choice is awaiting an answer (decision point)"
+            # Ordinary dialogue is the agent's to operate: the ok key IS the
+            # policy's jump key, and choices are how the story advances, so
+            # refusing all of them left the agent unable to play the game it is
+            # supposed to learn.  The user's rule is narrower - the difficulty
+            # pick must never be made by this layer - and that pick is
+            # identifiable by its text (V.GUARDED_CHOICES, captured from the
+            # running game rather than assumed).
+            if info.get("guardedChoice"):
+                return ("a dialogue choice that must not be answered by the agent "
+                        "is awaiting an answer: %r" % (info.get("choices"),))
+            if not info.get("choices"):
+                # Fail closed: a choice we cannot read is a choice we cannot
+                # classify, and ok would commit whichever option is highlighted.
+                return ("a dialogue choice is awaiting an answer but its options "
+                        "could not be read (decision point)")
         if self.drive == "realtime" and not info.get("tickerRunning"):
             # Acting against a frozen game is worse than not acting: the round
             # looks healthy, reports steps, and collects a still picture.  That
@@ -1284,6 +1460,21 @@ class CdpSpeedrunEnv:
                 "the engine's ticker is not running, so a realtime round would "
                 "act against a frozen game (resume it, or the drive mode is wrong)"
             )
+        if info.get("menuOperable"):
+            # A menu the agent may actually operate: the shop, the item/equipment
+            # screens, the ESC menu itself.  It used to be cancel-only, which made
+            # the whole shop unreachable content - the agent could walk in and
+            # nothing else.  What keeps this narrow is the entry under the cursor:
+            # ok commits it, so a forbidden one is refused, and a scene whose
+            # entries cannot be read is refused too (an unclassified entry may be
+            # the one that costs the save).
+            if info.get("guardedMenuEntry"):
+                return ("a menu entry that must not be committed is highlighted: %r"
+                        % (info.get("menuEntries"),))
+            if not info.get("menuEntries"):
+                return ("an operable menu's highlighted entry could not be read "
+                        "(decision point)")
+            return None
         if not info.get("inGameplay"):
             return "scene %r is not Scene_Map gameplay" % (info.get("scene"),)
         return None

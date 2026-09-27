@@ -129,6 +129,134 @@
     "Scene_Shop", "Scene_Name", "Scene_GameEnd"
   ];
 
+  /* Options the agent must never commit, matched against the SANITISED text.
+
+     The safety layer used to refuse every dialogue choice, because the policy's
+     jump key is the ok key and would commit whichever option is highlighted.
+     That also made the story unplayable: choices are how the game advances.  The
+     user's rule is that ordinary dialogue is the agent's to operate and the
+     difficulty pick is not, and the pick is identifiable by its text - captured
+     from the running game with scripts/watch_choices.py:
+
+       ['按下简单难度按钮', '按下普通难度按钮', '\C[18]按下困难难度按钮']
+
+     MZ texts carry control codes (`\C[18]` sets a colour), so they are stripped
+     before matching or the third option slips through.  The three captured
+     strings are matched on their common token ("难度") rather than in full: it
+     survives a rewording, and the only way a substring rule can go wrong here is
+     by over-blocking a dialogue that mentions difficulty, which aborts a round
+     instead of committing an irreversible pick. */
+  V.GUARDED_CHOICES = [
+    "难度"
+  ];
+  V.stripControlCodes = function (text) {
+    return String(text)
+      .replace(/\\[A-Za-z]+\[\d+\]/g, "")
+      .replace(/\\[.{}|!^<>$]/g, "");
+  };
+  V.guardedChoice = function (choices) {
+    var list = choices || [];
+    for (var i = 0; i < list.length; i++) {
+      var text = V.stripControlCodes(list[i]);
+      for (var j = 0; j < V.GUARDED_CHOICES.length; j++) {
+        if (text.indexOf(V.GUARDED_CHOICES[j]) >= 0) { return true; }
+      }
+    }
+    return false;
+  };
+
+  /* ---------------------------------------------------------- menu surfaces
+     The ESC menu is NOT RPG Maker's: it is drawn from custom Sprites
+     (Sprite_MenuCommand, Sprite_MenuSystem, Sprite_Item, ...), so the standard
+     Window probes find nothing at all.  Each panel keeps `_items` and a
+     `_selectIndex` cursor, and every entry carries a stable symbol in `name`
+     (or `_title` for the item categories), captured from the running game:
+
+       _menuCommand  : STATIC_TEXT_MENU_ITEM / _SKILL / _MAP / _BOOK / _SYSTEM
+       _systemPanel  : ..._BACK_TOWN / _RETURN_TO_TITLE / _RETURN_LOAD_GAME
+                       / _OPTIONS / _EXIT_GAME
+       _itemPanel    : STATIC_TEXT_MENU_ITEM_CONSUMABLES / _WEAPONS
+                       / _STONES / _ORNAMENTS
+
+     Matching the symbol rather than the displayed text is deliberate: the text
+     is localised and reworded across patches, and the user's own description of
+     the last column named one entry "返回菜单" when the game's is
+     "STATIC_TEXT_MENU_SYSTEM_BACK_TOWN" - "返回城镇".  A denylist built from the
+     spoken wording would have missed it. */
+  V.MENU_ENTRY_PANELS = [
+    "_menuCommand", "_systemPanel", "_itemPanel", "_skillPanel", "_bookPanel",
+    "_load", "_option"
+  ];
+  /* Every entry of the last column except "back to town".  The user's rule:
+     that column is one-way traffic - it can return to the title screen, load
+     another save or quit the game - and only the town return is safe. */
+  V.MENU_ENTRY_DENY = [
+    "STATIC_TEXT_MENU_SYSTEM_RETURN_TO_TITLE",
+    "STATIC_TEXT_MENU_SYSTEM_RETURN_LOAD_GAME",
+    "STATIC_TEXT_MENU_SYSTEM_OPTIONS",
+    "STATIC_TEXT_MENU_SYSTEM_EXIT_GAME"
+  ];
+  /* Scenes the agent may operate rather than only escape.  The rest of
+     V.MENU_SCENES stays cancel-only.
+
+     Only scenes the running game was SEEN to use are listed.  The first version
+     also carried Scene_Item / Scene_Equip / Scene_Skill / Scene_Status by RPG
+     Maker convention: those classes do exist (enumerating window.Scene_* lists
+     them) but a screenshot of the menu showed items, orbs and accessories drawn
+     as PANELS inside Scene_Menu, and its "skill" panel is a page that
+     demonstrates which key triggers which action.  Listing unobserved scenes
+     reads as coverage without being any - add one only after seeing it. */
+  V.OPERABLE_SCENES = ["Scene_Menu", "Scene_Shop", "Scene_SkillSt"];
+  V.menuEntries = function () {
+    var s = window.SceneManager && SceneManager._scene;
+    if (!s) { return []; }
+    var out = [];
+    for (var i = 0; i < V.MENU_ENTRY_PANELS.length; i++) {
+      var key = V.MENU_ENTRY_PANELS[i];
+      var panel = s[key];
+      if (!panel || !panel._items || !panel._items.length) { continue; }
+      var index = panel._selectIndex;
+      if (typeof index !== "number" || index < 0 || index >= panel._items.length) {
+        continue;
+      }
+      var item = panel._items[index];
+      if (!item) { continue; }
+      var name = item.name || item._title;
+      if (!name) { continue; }
+      out.push({panel: key, name: String(name), index: index});
+    }
+    /* The shop and the save/load screens are ordinary MZ scenes, whose entries
+       live in Window_Command._list with the cursor in index(); the custom
+       panels above are only the ESC menu.  Both are read so "operable" does not
+       mean "readable in one shape only". */
+    var walk = function (node, depth) {
+      if (!node || depth > 4) { return; }
+      try {
+        if (node._list && node._list.length && typeof node.index === "function") {
+          var i = node.index();
+          var entry = node._list[i];
+          var symbol = (typeof node.currentSymbol === "function")
+            ? node.currentSymbol() : null;
+          var name = symbol || (entry && (entry.symbol || entry.name));
+          if (name) {
+            out.push({panel: (node.constructor ? node.constructor.name : "?"),
+                      name: String(name), index: i});
+          }
+        }
+        var kids = node.children;
+        for (var k = 0; kids && k < kids.length; k++) { walk(kids[k], depth + 1); }
+      } catch (e) { /* a probe must never break the scene */ }
+    };
+    walk(s, 0);
+    return out;
+  };
+  V.isGuardedEntry = function (entries) {
+    for (var i = 0; i < entries.length; i++) {
+      if (V.MENU_ENTRY_DENY.indexOf(entries[i].name) >= 0) { return true; }
+    }
+    return false;
+  };
+
   V.safety = function () {
     var scene = V.sceneName();
     var busy = guard("messageBusy", function () {
@@ -143,12 +271,33 @@
        exactly this, and a difficulty pick is not something a safety layer gets
        to make.  MZ signals "awaiting" with a live _choiceCallback; the choices
        array is reported too because games reimplement this. */
+    /* The option texts are reported, not only the fact that a choice exists.
+       Refusing every choice made the story unplayable for the agent, and the one
+       choice that must never be made by a layer that cannot read it - the
+       difficulty pick - is identifiable by its text.  Reporting the strings is
+       what lets the caller refuse exactly that one instead of all of them. */
+    var choices = guard("messageChoices", function () {
+      var m = window.$gameMessage;
+      if (!m) { return []; }
+      var c = (typeof m.choices === "function") ? m.choices() : m._choices;
+      if (!c) { return []; }
+      return Array.prototype.slice.call(c).map(function (x) { return String(x); });
+    });
+    /* Which option is highlighted.  The window owns it, not $gameMessage, and
+       it is what makes "answer with the operator's preset" deterministic: move
+       by the difference, then confirm. */
+    var choiceIndex = guard("choiceIndex", function () {
+      var s = window.SceneManager && SceneManager._scene;
+      var w = s && (s._choiceListWindow || s._choiceWindow);
+      if (w && typeof w.index === "function") { return w.index(); }
+      return null;
+    });
     var awaiting = guard("messageChoice", function () {
       var m = window.$gameMessage;
       if (!m) { return false; }
       if (m._choiceCallback) { return true; }
-      var choices = (typeof m.choices === "function") ? m.choices() : null;
-      return !!(choices && choices.length > 0 && m.isBusy && m.isBusy());
+      var c = (typeof m.choices === "function") ? m.choices() : null;
+      return !!(c && c.length > 0 && m.isBusy && m.isBusy());
     });
     /* Is the engine's own loop actually running?  Realtime driving depends on
        it, and a stopped ticker is invisible from the outside: the game sits in
@@ -158,10 +307,26 @@
       var t = window.Graphics && Graphics.app && Graphics.app.ticker;
       return !!(t && t.started);
     });
+    /* Every panel reports, not just the first: which one is handling input is
+       the game's business, and "any of them is a forbidden entry" is the safe
+       reading - refusing costs a round, committing costs the save. */
+    var entries = guard("menuEntries", function () { return V.menuEntries(); }) || [];
     return {
       scene: scene,
       messageBusy: !!busy,
+      menuEntries: entries,
+      guardedMenuEntry: V.isGuardedEntry(entries),
+      menuOperable: V.OPERABLE_SCENES.indexOf(scene) >= 0,
       awaitingChoice: !!awaiting,
+      choices: choices || [],
+      // Control codes stripped: callers match option text, and `\C[18]` must
+      // not hide the option (the difficulty pick's third entry carries one).
+      choiceTexts: (choices || []).map(V.stripControlCodes),
+      choiceIndex: choiceIndex,
+      // True when an awaiting choice includes an option that must not be
+      // committed by the agent.  The caller refuses on this, not on "a choice
+      // exists" - see V.GUARDED_CHOICES.
+      guardedChoice: !!V.guardedChoice(choices || []),
       tickerRunning: !!ticking,
       // Only Scene_Map takes gameplay verbs.  sceneName() returns null both
       // before the game boots and when the read throws, and null !==

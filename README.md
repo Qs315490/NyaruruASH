@@ -119,6 +119,11 @@ AGENTS.md     项目工作文档入口
    .venv/bin/ash run --backend cdp --corpus data/corpus \
        --idm models/idm-demo.pt --idm-replay data/idm-human.npz --policy-steps 200
    ```
+   难度雕像的对话**关不掉**（只能选一个），所以必须有个预设答案：默认取
+   `config/game.yaml:difficulty_preset`（**默认「简单」**——语料是速通录像，速通都在简单
+   难度下跑，混着难度等于比较两个不同的游戏）。`--difficulty 普通`（选项文本，或从 1 数起的
+   序号）可临时覆盖，`--difficulty off` 则回复成「拒绝并中止该轮」。其余普通对话选项
+   仍由 agent 自己操作。
    没有 `--idm-replay`，每轮自博弈的近似重复转移会把 IDM 打回「预测类别先验」，
    伪标签退化成常数，π 永远不会更新（见上表）。实测带 replay 的一轮：
    `majority_share` 0.72–0.87（原先 0.999–1.000）、`classes_used` 7–10（原先 1–3）、
