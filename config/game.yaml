@@ -1,0 +1,90 @@
+# 游戏与运行参数
+#
+# 这里只放「已核实」或「需要实测确认」的参数，其余一律由 Phase 0 探针产出。
+name: 咸鱼喵喵 / Nyaruru Fishy Fight
+steam_appid: 1478160          # Steam app id（已核实）
+speedrun_game: w6j7mg76       # speedrun.com game id（已核实）
+speedrun_category: n2yx001d   # Ending 1 分类 id（已核实，WR 2418s）
+cdp_port: 9222
+cdp_endpoint: http://127.0.0.1:9222
+fps: 60                       # RPG Maker MZ 的 SceneManager 逻辑帧率
+
+window:
+  title_contains: ["Nyaruru", "咸鱼喵喵"]
+  capture:                    # X11 后端（保底方案）的抓取区域，需按实际窗口调整
+    x: 0
+    y: 0
+    width: 1280
+    height: 720
+
+# 键位映射
+#
+# RPG Maker MZ 默认按键表（Input.keyMapper）：Z/Enter/Space = ok，X/Esc = cancel，
+# Shift = dash，方向键 = 移动。动作游戏通常还会用到 X（攻击）与 Shift（冲刺）。
+# 但本游戏的实际绑定尚未实测，Phase 0 的 probe 会在游戏内逐键验证并回写本文件。
+# 键位映射 —— 已按游戏内「控制设置」页面核实（2026-09-20 截图）
+#
+# 游戏内绑定：
+#   上/下/左/右 = 方向键；确定 = Z（可重复）；取消 = X（可重复）
+#   跳跃 = Z；咸鱼攻击 = X；冲刺 = C；咸鱼技能 = V；必杀技 = A
+#   打开菜单 = ESC；显示地图 = M；使用物品 = F；更换武器 = S；快速读档 = D
+#   视角移动 = J/I/K
+#
+# 动作字典只建模速通需要的控制；快速读档 D 被有意排除（速通中按它等于作弊，
+# 且会污染示范数据）。
+keymap:
+  up:
+    names: [ArrowUp]
+    codes: [ArrowUp]
+    keycodes: [38]
+  down:
+    names: [ArrowDown]
+    codes: [ArrowDown]
+    keycodes: [40]
+  left:
+    names: [ArrowLeft]
+    codes: [ArrowLeft]
+    keycodes: [37]
+  right:
+    names: [ArrowRight]
+    codes: [ArrowRight]
+    keycodes: [39]
+  jump:            # 游戏内「跳跃」= Z（与「确定」同键）
+    names: [z]
+    codes: [KeyZ]
+    keycodes: [90]
+  attack:          # 游戏内「咸鱼攻击」= X
+    names: [x]
+    codes: [KeyX]
+    keycodes: [88]
+  dash:            # 游戏内「冲刺」= C
+    names: [c]
+    codes: [KeyC]
+    keycodes: [67]
+  special:         # 游戏内「咸鱼技能」= V
+    names: [v]
+    codes: [KeyV]
+    keycodes: [86]
+  interact:        # 游戏内「确定」= Z（同 jump）；Enter 也能确认
+    names: [z, Enter]
+    codes: [KeyZ, Enter]
+    keycodes: [90, 13]
+  menu:            # 游戏内「打开菜单」= ESC
+    names: [Escape]
+    codes: [Escape]
+    keycodes: [27]
+  cancel:          # 游戏内「取消」= X（与攻击同键）
+    names: [x]
+    codes: [KeyX]
+    keycodes: [88]
+  ult:             # 游戏内「必杀技」= A（释放当前咸鱼武器的对应大招）
+    names: [a]
+    codes: [KeyA]
+    keycodes: [65]
+  weapon_switch:   # 游戏内「更换武器」= S；切换咸鱼武器
+    #   引擎核实：Game_Player.controlWeaponChange() 读输入名 "cfish"，
+    #   而 keyMapper 里 83(KeyS) -> "cfish"。所以 S 是切换键，
+    #   与 game.yaml 原有的 J/I/K(视角)、F(物品)、M(地图) 不同类。
+    names: [s]
+    codes: [KeyS]
+    keycodes: [83]

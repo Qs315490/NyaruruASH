@@ -1,0 +1,17 @@
+runs/
+data/
+models/
+reports/
+__pycache__/
+*.pyc
+.venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+.ruff_cache/
+*.ckpt
+*.pt
+*.npz
+.nwjs-sdk/
+.nw-profile/
+.nwjs-sdk

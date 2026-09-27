@@ -1,0 +1,8 @@
+# Phase 0 探针写入的实测键位（与 game.yaml 的 keymap 同构）
+#
+# 该文件由 `vpt probe` 覆盖：探针在游戏内按下每个逻辑按键，观察
+# $gamePlayer / $gameScreen / 场景栈是否发生变化，只有产生可观测反应的绑定
+# 才会被标记 verified: true。在此之前请以 game.yaml 中的默认值为准。
+verified: false
+note: 尚未运行 Phase 0 探针
+keymap: {}
