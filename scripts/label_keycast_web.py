@@ -1093,7 +1093,7 @@ def main() -> int:
     Server.video = video
     Server.mapping_path = mapping_path
     Server.keys = keys
-    Server.mapping = {k: "(ignore)" for k in DEFAULT_CELLS}
+    Server.mapping = {k: "(ignore)" for k in (set(DEFAULT_CELLS) | set(Server.cells or {}))}
     # L/R were pinned offline by camera shift + occupation; seed them.
     # All four directions have unambiguous defaults; only the action buttons need a human
     # to look at the panel and decide.  Seeding just L/R left U/D unassigned, which reads
@@ -1102,7 +1102,12 @@ def main() -> int:
     if mapping_path.exists():
         try:
             got = json.loads(mapping_path.read_text()).get("cells") or {}
-            Server.mapping.update({k: v for k, v in got.items() if k in DEFAULT_CELLS})
+            # Accept every cell THIS video has, not just the built-in layout: DEFAULT_CELLS
+            # knows only L/R/U/D/c1..c6, so filtering by it silently discarded the mapping of
+            # every cell added by hand (x1..x6) - on every single restart.  The save path was
+            # fixed for this and the load path was missed, which is why it kept coming back.
+            known = set(Server.cells or DEFAULT_CELLS) | set(got)
+            Server.mapping.update({k: v for k, v in got.items() if k in known})
         except Exception:                             # noqa: BLE001
             pass
 
