@@ -189,8 +189,7 @@ def test_runner_and_env_agree_on_the_timestep():
     env = FakeSpeedrunEnv()
     kdm = KeyMomentModel()
     kdm.embedder = _Emb()
-    kdm.classify = lambda e, s: False          # type: ignore[method-assign]
-    kdm.cluster_of = lambda e: -1              # type: ignore[method-assign]
+    kdm.observe = lambda e, s: (False, -1, False)  # type: ignore[method-assign]
     policy = AshPolicy(AshPolicyConfig(image_size=32, w_s=4, w_l=2, num_layers=1))
     runner = InferenceRunner(
         lambda: env, policy, kdm, action_space=env.action_space,

@@ -215,8 +215,7 @@ def _runner_for(env, **kw):
 
     kdm = KeyMomentModel()
     kdm.embedder = _Emb()
-    kdm.classify = lambda embedding, seen: False   # type: ignore[method-assign]
-    kdm.cluster_of = lambda embedding: -1          # type: ignore[method-assign]
+    kdm.observe = lambda embedding, seen: (False, -1, False)  # type: ignore[method-assign]
 
     policy = AshPolicy(AshPolicyConfig(image_size=32, w_s=4, w_l=2, num_layers=1))
     return InferenceRunner(

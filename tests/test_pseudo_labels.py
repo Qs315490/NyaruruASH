@@ -42,6 +42,9 @@ class _K:
     def classify(self, embedding, seen_clusters):
         return False
 
+    def classify_sequence(self, embeddings):
+        return np.zeros(len(embeddings), dtype=bool)
+
     def cluster_of(self, embedding):
         return -1
 
@@ -145,3 +148,40 @@ def test_bootstrap_updates_policy_when_labels_vary(tmp_path):
 
     assert report["policy"], "usable labels must still train pi"
     assert report["pseudo_labels"][0]["majority_share"] <= 0.9
+
+
+def test_logit_diagnosis_separates_bias_from_input():
+    """A collapsed labelling must report *why* it collapsed.
+
+    A per-class bias that no frame can outvote and a genuinely constant input
+    both show majority_share 1.0; telling them apart needs the logits split into
+    temporal movement and bias spread.  Measured on a real IDM: 0.008 against
+    0.13, i.e. the argmax never depended on the frame.
+    """
+    from ash.loop.bootstrap import logit_diagnosis
+
+    rng = np.random.default_rng(0)
+    # Bias-dominated: a fixed per-class offset, almost no frame-to-frame motion.
+    bias = np.tile(rng.normal(scale=0.13, size=16), (200, 1)).astype(np.float32)
+    bias += rng.normal(scale=0.008, size=bias.shape).astype(np.float32)
+    d = logit_diagnosis(bias)
+    assert d["bias_over_temporal"] > 1.0, d
+    assert 0.0 < d["logit_temporal_std"] < 0.05
+    assert d["logit_bias_spread"] > 0.05
+
+    # Input-driven: the classes move as much as they differ.
+    driven = rng.normal(size=(200, 16)).astype(np.float32) * 2.0
+    d2 = logit_diagnosis(driven)
+    assert d2["bias_over_temporal"] < 1.0, d2
+
+    assert logit_diagnosis(np.zeros((0, 16), dtype=np.float32)) == {}
+    assert logit_diagnosis(None) == {}
+
+
+def test_report_carries_the_logit_diagnosis(tmp_path):
+    """It has to reach the report, not just be computable."""
+    report = _run_bootstrap(_ConstantIdm(), tmp_path)
+    stats = report["pseudo_labels"][0]
+    assert "logit_temporal_std" in stats and "logit_bias_spread" in stats
+    # _ConstantIdm returns a hard-coded vector: zero temporal movement.
+    assert stats["logit_temporal_std"] == 0.0

@@ -30,6 +30,7 @@ BUTTONS: tuple[str, ...] = (
     "ult",           # keyboard: A - releases the current weapon's ultimate
     "weapon_switch", # keyboard: S - cycles the 咸鱼 weapons
     "cancel",        # keyboard: X - distinct from attack by intent
+    "item",          # keyboard: F - uses the selected item (in-map hotkey)
 )
 
 BUTTON_INDEX: dict[str, int] = {name: i for i, name in enumerate(BUTTONS)}
@@ -39,7 +40,7 @@ BUTTON_INDEX: dict[str, int] = {name: i for i, name in enumerate(BUTTONS)}
 # being repeated as a magic number in each model.  tests/test_action_space.py
 # asserts it still equals len(ActionSpace.minimal()), which is what keeps the
 # constant from drifting away from the space it describes.
-DEFAULT_NUM_ACTIONS = 16
+DEFAULT_NUM_ACTIONS = 20
 
 
 def mask_from_buttons(buttons: Iterable[str]) -> int:
@@ -130,6 +131,23 @@ class ActionSpace:
             ("down",),
             ("down", "jump"),
             ("up",),
+            # Appended, never inserted: an action index is a recorded label, so
+            # the masks above must keep their positions.  These four are the
+            # combat and item verbs - the 咸鱼 skill (V, costs SP), the weapon
+            # ultimate (A, needs the 必杀 energy bar), cycling the 咸鱼 weapons
+            # (S), and using the selected item (F).
+            #
+            # docs/game-systems.md already flagged S and A as missing: "武器切换
+            # 是动作空间的一部分：S 切换 + A 大招目前不在 walker 的动作空间里，
+            # 这可能是战斗能力受限的原因之一".  F was deliberately excluded
+            # alongside the map key and the fast-load key; the fast-load one is
+            # still excluded because it is cheating in a speedrun, while F is the
+            # in-map way to eat - i.e. the only healing the policy can do - and
+            # the user has asked for it explicitly.
+            ("special",),
+            ("ult",),
+            ("weapon_switch",),
+            ("item",),
         ]
         space = cls.from_button_names(combos)
         return cls(masks=space.masks, meta=dict.fromkeys(space.masks, "heuristic"))

@@ -363,18 +363,102 @@ class CdpSpeedrunEnv:
             if self.config.keymap.get(b) and self.config.keymap[b].names
         ]
 
-    def _check_safe(self) -> None:
+    def _check_safe(self, *, escape: bool = False) -> None:
         """Refuse to touch the keyboard outside Scene_Map gameplay.
 
         The runner asks unsafe_reason() before it acts, but this is the
         backstop: no caller, however written, gets to press gameplay keys on a
         title or menu screen, where those same keys mean "confirm".
+
+        `escape=True` is the ONE other mode, and it is not a bypass: the gate is
+        still the gate, and in this mode it permits exactly one thing - the
+        cancel button, on a scene that agent.js lists as a menu, when no choice
+        is pending - which is what menu_escape_reason() checks.  Everything else
+        still fails here, and enforce_safety=False still switches the whole gate
+        off for diagnostic probes.
         """
         if not self.enforce_safety:
             return
-        reason = self.unsafe_reason()
+        reason = self.menu_escape_reason() if escape else self.unsafe_reason()
         if reason:
             raise UnsafeSceneError("refusing to dispatch input: %s" % reason)
+
+    def menu_escape_reason(self) -> str | None:
+        """None when a bounded cancel-only menu escape may be attempted.
+
+        Narrower than every other input path in the class: a named scene
+        (V.MENU_SCENES, in agent.js), a named button (cancel), no directions, no
+        ok, and a cap imposed by the caller.  It exists because an agent that
+        walks into a menu could otherwise never leave it - gameplay input is
+        refused there for good reason - so a single accidental press cost the
+        whole round and needed a human every time.
+        """
+        try:
+            info = self.safety()
+        except CdpError as exc:
+            return "safety probe failed (%s)" % (str(exc)[:120],)
+        if not info:
+            return "safety probe unavailable: agent.js not installed"
+        if info.get("inGameplay"):
+            return "already in gameplay"
+        if info.get("awaitingChoice"):
+            return "a dialogue choice is awaiting an answer: cancel would answer it"
+        if info.get("messageBusy"):
+            return "a message is waiting: only ok advances it, and ok is not allowed"
+        if not info.get("menu"):
+            return "scene %r is not a known menu template" % (info.get("scene"),)
+        if self.drive == "realtime" and not info.get("tickerRunning"):
+            return "the engine's ticker is not running, so cancel would go nowhere"
+        return None
+
+    def _cancel_mask(self) -> int:
+        """The mask for the game's cancel button, from the configured keymap."""
+        binding = self.game_config.keymap.get("cancel")
+        if binding is None or not binding.names:
+            raise CdpError("no cancel button bound in the keymap")
+        return mask_from_buttons(["cancel"])
+
+    def _dispatch(self, action: int) -> None:
+        """Tap the buttons of a mask: press, brief settle, release."""
+        bindings = self._bindings_for(action)
+        for binding in bindings:
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
+        time.sleep(self.config.frame_ms / 1000.0)
+        for binding in bindings:
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+
+    def escape_menu(self, *, max_presses: int = 4) -> dict[str, Any]:
+        """Press ONLY cancel, at most `max_presses` times, to back out to gameplay.
+
+        Returns {"escaped", "presses", "scene", "reason"}.  It re-reads the scene
+        after every press, so it stops the moment gameplay is reached and never
+        fires into Scene_Map.
+        """
+        out: dict[str, Any] = {"escaped": False, "presses": 0, "scene": None, "reason": None}
+        try:
+            out["scene"] = (self.safety() or {}).get("scene")
+        except CdpError:
+            pass
+        reason = self.menu_escape_reason()
+        if reason:
+            out["reason"] = reason
+            return out
+        try:
+            mask = self._cancel_mask()
+        except CdpError as exc:
+            out["reason"] = str(exc)
+            return out
+        for _ in range(max(0, int(max_presses))):
+            self._check_safe(escape=True)      # the gate, in its narrow mode
+            out["presses"] += 1
+            self._dispatch(mask)
+            info = self.safety() or {}
+            out["scene"] = info.get("scene")
+            if info.get("inGameplay"):
+                out["escaped"] = True
+                return out
+        out["reason"] = "still not in gameplay after %d cancel press(es)" % out["presses"]
+        return out
 
     def step_realtime(self, action: int, duration_s: float) -> None:
         """Hold an action for `duration_s` of real time, then release it.

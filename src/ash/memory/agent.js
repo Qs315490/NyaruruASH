@@ -106,6 +106,29 @@
      screen looks. */
   V.CONFIRM_SCENES = [];
 
+  /* Scenes where CANCEL is a back-out and cannot commit anything.
+
+     Deliberately a separate list from V.CONFIRM_SCENES, because the criterion
+     is different: that one asks whether OK is safe (it never is), this one asks
+     whether CANCEL is.  No scene may appear in both.
+
+     Why this exists: the agent presses its way into these screens by accident -
+     measured, Scene_SkillSt after 39 steps of a real round - and could not get
+     back out, because gameplay input is refused outside Scene_Map (correctly:
+     ok commits selections).  One wrong screen therefore cost the whole round,
+     the random-policy supplement included, and needed a human to recover the
+     game.  A bounded, cancel-only exit is strictly narrower than any gameplay
+     input and cannot pick an entry.
+
+     An unrecognised scene is NOT escaped.  Fail closed is the default, and a
+     custom screen is only listed here once cancel is *measured* to leave it
+     without touching state. */
+  V.MENU_SCENES = [
+    "Scene_Menu", "Scene_Item", "Scene_Skill", "Scene_SkillSt", "Scene_Equip",
+    "Scene_Status", "Scene_Options", "Scene_File", "Scene_Save", "Scene_Load",
+    "Scene_Shop", "Scene_Name", "Scene_GameEnd"
+  ];
+
   V.safety = function () {
     var scene = V.sceneName();
     var busy = guard("messageBusy", function () {
@@ -145,7 +168,9 @@
       // GAMEPLAY_SCENE, so the fail-closed case is handled by this comparison.
       inGameplay: scene === V.GAMEPLAY_SCENE,
       // One ok press is safe here (and required); nothing else is.
-      confirm: V.CONFIRM_SCENES.indexOf(scene) >= 0
+      confirm: V.CONFIRM_SCENES.indexOf(scene) >= 0,
+      // Bounded cancel-only exit is allowed here (never ok, never a direction).
+      menu: V.MENU_SCENES.indexOf(scene) >= 0
     };
   };
 
@@ -189,6 +214,37 @@
   V.pump.hijacked = false;
   V.pump.ticks = 0;
 
+  /* Where the hand-driven clock starts, and why it must not be zero.
+   *
+   * The pump used to begin at time 0 and feed the ticker 0, dt, 2*dt, ... while
+   * the ticker's own `lastTime` was ~40000 ms of real page uptime.  PIXI's
+   * Ticker.update() only runs a frame when `currentTime > lastTime`; otherwise
+   * it zeroes deltaTime and emits nothing - so the first pumped frame was
+   * silently swallowed - and it then does `this.lastTime = currentTime`,
+   * rebasing the timeline onto the synthetic clock.  When the engine took the
+   * loop back, the next real update saw a ~40 s jump.
+   *
+   * Anchoring the origin to the real clock keeps the pumped timeline inside the
+   * real one: the first frame's delta is exactly dt, no frame is dropped, and a
+   * game that reads the ticker clock (or compares against performance.now())
+   * stays consistent.  The delta stays a fixed dt, so determinism is preserved.
+   */
+  V.pump.clockNow = function () {
+    return (typeof performance !== "undefined" && performance.now)
+      ? performance.now() : Date.now();
+  };
+  V.pump.anchorClock = function () {
+    V.pump.origin = V.pump.clockNow();
+    V.pump.ticks = 0;
+    V.pump.time = V.pump.origin;
+    if (V.pump.ticker) {
+      // Make the first pumped frame's delta exactly dt instead of a negative
+      // difference against a stale real timestamp.
+      V.pump.ticker.lastTime = V.pump.origin;
+    }
+    return V.pump.origin;
+  };
+
   V.pump.install = function (dtMs) {
     // Attach the fall-recovery marker tracker as soon as the game globals
     // exist; idempotent, and retried on every install until it succeeds.
@@ -224,6 +280,10 @@
       V.pump.mode = "ticker";
       V.pump.installed = true;
       V.pump.hijacked = true;
+      // Anchor before anything is pumped: the ticker's own lastTime is real
+      // page uptime, so a synthetic clock starting at zero would make the first
+      // pumped frame a negative delta - which PIXI swallows whole.
+      V.pump.anchorClock();
       V.pump.guard();
       return true;
     }
@@ -255,8 +315,26 @@
    * installed; uninstall()/resume() remove the shadow and the engine gets its
    * start() back.  The shadow is an own property on the ticker instance, which
    * no snapshot root reaches, so a rollback cannot clobber it. */
+  /* The ticker this agent may be guarding, whether or not THIS instance
+   * installed the guard.
+   *
+   * Never trust V.pump.ticker alone.  Re-injecting agent.js replaces
+   * window.__ash - and with it V - while the shadow start() left on the ticker
+   * instance stays behind; the new instance then holds no handle to the
+   * ticker and cannot remove the guard.  Measured on the real game: pump
+   * install -> re-inject -> resume() reported {resumed:true} while the ticker
+   * stayed stopped and shadowed, so the game was frozen for good and both
+   * recovery paths (close(resume=True), resume_game()) lied about it.  A guard
+   * that outlives the agent must therefore be findable from the ticker side. */
+  V.pump.resolvedTicker = function () {
+    if (V.pump.ticker) { return V.pump.ticker; }
+    if (window.Graphics && Graphics.app && Graphics.app.ticker) {
+      return Graphics.app.ticker;
+    }
+    return null;
+  };
   V.pump.guard = function () {
-    var t = V.pump.ticker;
+    var t = V.pump.resolvedTicker();
     if (!t || t.__ashGuarded) { return false; }
     t.__ashStart = t.start;
     // Remember WHERE start() came from.  PIXI puts it on Ticker.prototype, so
@@ -265,14 +343,18 @@
     // the method entirely on delete, so the origin decides how to undo.
     t.__ashOwnStart = Object.prototype.hasOwnProperty.call(t, "start");
     t.start = function () {
-      if (V.pump.installed) { return this; }
+      // Ask the LIVE agent, never the closed-over V: the instance that
+      // installed this shadow may be long gone, and reading its stale
+      // `installed` flag is what kept start() a no-op forever.
+      var live = window.__ash;
+      if (live && live.pump && live.pump.installed) { return this; }
       return t.__ashStart.apply(this, arguments);
     };
     t.__ashGuarded = true;
     return true;
   };
-  V.pump.unguard = function () {
-    var t = V.pump.ticker;
+  V.pump.unguard = function (ticker) {
+    var t = ticker || V.pump.resolvedTicker();
     if (!t || !t.__ashGuarded) { return false; }
     if (t.__ashOwnStart) { t.start = t.__ashStart; } else { delete t.start; }
     t.__ashStart = null;
@@ -291,20 +373,32 @@
   V.pump.resume = function () {
     var out = { resumed: false, reason: null };
     try {
-      var t = V.pump.ticker || (window.Graphics && Graphics.app && Graphics.app.ticker);
+      var t = V.pump.resolvedTicker();
       if (!t) { out.reason = "no ticker"; return out; }
       // Release ownership BEFORE starting: the guard refuses start() while
       // the pump is installed, so the flag has to drop first.
       V.pump.installed = false;
       V.pump.hijacked = false;
-      V.pump.unguard();
+      // Pass the ticker explicitly: the guard may have been left by an older
+      // agent instance, which is exactly when the V.pump.ticker lookup fails.
+      V.pump.unguard(t);
+      // Re-anchor on the way out too: the engine resumes against the real
+      // clock, so the next pumped run must start from there and not from the
+      // stale origin of the previous one.
+      V.pump.origin = V.pump.clockNow();
+      V.pump.ticks = 0;
       t.autoStart = true;
       // start() early-returns while started is true, and a ticker can be left
       // started-but-without-a-pending-frame (a zombie); clearing the flag is
       // what makes the call actually re-request a frame.
       t.started = false;
       t.start();
-      out.resumed = true;
+      // Report what actually happened.  Returning success while the ticker
+      // stayed stopped is how a frozen game passed for a running one: the
+      // round then acted against a still engine, and every recovery path
+      // claimed to have resumed it.
+      out.resumed = !!t.started;
+      if (!out.resumed) { out.reason = "ticker did not start"; }
       return out;
     } catch (e) {
       out.reason = String(e);
@@ -360,10 +454,11 @@
       V.pump.ticker.maxFPS = 0;
       V.pump.mode = "ticker";
       V.pump.installed = true;
+      V.pump.anchorClock();
       V.pump.guard();
     }
-    V.pump.time += V.pump.dt;
     V.pump.ticks += 1;
+    V.pump.time = (V.pump.origin || 0) + V.pump.ticks * V.pump.dt;
     if (V.pump.mode === "ticker") {
       // A start that slipped through before the guard was applied leaves the
       // ticker running; re-stop it so a frame is never both pumped by hand and

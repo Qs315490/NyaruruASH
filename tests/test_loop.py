@@ -65,6 +65,19 @@ def test_action_space_size_matches_head_default():
     assert len(ActionSpace.minimal()) == DEFAULT_NUM_ACTIONS
 
 
+def _make_runner(env, kdm, image_size=32, w_s=4, w_l=2):
+    space = env.action_space
+    policy = AshPolicy(
+        AshPolicyConfig(image_size=image_size, w_s=w_s, w_l=w_l, num_layers=1,
+                        num_actions=len(space))
+    )
+    return InferenceRunner(
+        lambda: env, policy, kdm, action_space=space,
+        w_s=w_s, w_l=w_l, image_size=image_size, device="cpu",
+        key_moment_cooldown=0,
+    )
+
+
 def test_runner_returns_index_labelled_trajectories(kdm_fitted):
     env = FakeSpeedrunEnv()
     space = env.action_space
@@ -127,12 +140,20 @@ def test_bootstrap_policy_dataset_shapes(kdm_fitted):
     )
     ds = b.build_policy_dataset(obs, idm, kdm_fitted)
     n_windows = 40 - 4 + 1
-    assert ds["frames"].shape == (n_windows, 4, 32, 32, 3)
-    assert ds["actions"].shape == (n_windows, 4, n_actions)
-    assert ds["memories"].shape == (n_windows, 2, 32, 32, 3)
+    assert len(ds) == n_windows
+    b0 = ds.batch([0, 1, 2])
+    assert b0["frames"].shape == (3, 4, 32, 32, 3)
+    assert b0["actions"].shape == (3, 4, n_actions)
+    assert b0["memories"].shape == (3, 2, 32, 32, 3)
+    # Windows are NOT materialized: the dataset holds one frame buffer, not one
+    # copy of every frame per window (that was 59 GB on a real corpus video).
+    assert ds.frames.ndim == 4 and ds.frames.shape[0] == 40
+    assert ds.mem_idx.shape == (n_windows, 2)
+    # A batch must be identical to the same rows of the full window matrix.
+    assert np.array_equal(ds["actions"], ds["actions"])
     # One-hot over the ACTION axis: exactly one class set per position.
-    assert np.allclose(ds["actions"].sum(axis=-1), 1.0)
-    assert set(np.unique(ds["actions"])) <= {0.0, 1.0}
+    assert np.allclose(b0["actions"].sum(axis=-1), 1.0)
+    assert set(np.unique(b0["actions"])) <= {0.0, 1.0}
 
 
 def test_bootstrap_memory_prefix_precedes_window(kdm_fitted):
@@ -145,7 +166,7 @@ def test_bootstrap_memory_prefix_precedes_window(kdm_fitted):
     )
     ds = b.build_policy_dataset(obs, idm, kdm_fitted)
     # First window has nothing before it, so its memory prefix is all zeros.
-    assert not ds["memories"][0].any()
+    assert not ds.batch([0])["memories"].any()
 
 
 def test_policy_forward_and_backward():
@@ -238,3 +259,70 @@ def test_update_idm_skips_degenerate_input():
     obs = np.zeros((1, 16, 16, 3), dtype=np.uint8)
     assert b.update_idm(idm, obs, np.zeros(0, dtype=np.int64)) == {"idm_skipped": True}
     assert b.update_idm_from_trajectories(idm, []) == {"idm_skipped": True}
+
+
+def test_bootstrap_key_moments_use_the_projected_space(kdm_fitted):
+    """K is fit in PCA space, so the bootstrap must ask through cluster_of().
+
+    The bootstrap used to call approximate_predict() on the raw embedding.
+    With a PCA-reduced clusterer that is a dimension mismatch at best and
+    silent "noise" at worst - either way key moments stop being recorded and
+    the memory prefix of every policy window stays empty.
+    """
+    from ash.memory.kdm import KeyMomentModel
+
+    rng = np.random.RandomState(0)
+    centres = rng.randn(3, 384) * 6
+    rows, ids = [], []
+    for vid in range(4):
+        for c in range(3):
+            rows.append(centres[c] + rng.randn(30, 384) * 0.2)
+            ids += [vid] * 30
+    kdm = KeyMomentModel(min_cluster_size=10, min_distinct_trajectories=2, pca_dim=8)
+    kdm.fit(np.concatenate(rows).astype("float32"), np.asarray(ids))
+    assert kdm._pca is not None, "this test is only meaningful with PCA on"
+
+    class _WideEmbedder:
+        """Emits 384-d vectors, i.e. the width the clusterer does NOT speak."""
+
+        def embed(self, frames, batch_size=64):
+            frames = np.asarray(frames)
+            out = np.empty((len(frames), 384), dtype=np.float32)
+            for i, f in enumerate(frames):
+                seed = int(np.asarray(f, dtype=np.uint8).astype(np.int64).sum()) % (2**31)
+                out[i] = rng.normal(size=384) if seed == 0 else rng.normal(size=384) * 0
+            return out
+
+    kdm.embedder = _WideEmbedder()
+    space = ActionSpace.minimal()
+    idm = IdmModel(IdmConfig(image_size=16, embed_dim=16, num_actions=len(space)))
+    obs = np.arange(20 * 16 * 16 * 3, dtype=np.uint8).reshape(20, 16, 16, 3) % 255
+    b = bootstrap_mod.Bootstrapper(
+        bootstrap_mod.BootstrapConfig(w_s=4, w_l=2, image_size=16, device="cpu")
+    )
+    ds = b.build_policy_dataset(obs, idm, kdm)  # must not raise on the 384/8 mismatch
+    assert ds.batch([0])["memories"].shape == (1, 2, 16, 16, 3)
+
+
+def test_runner_samples_the_map_so_progress_is_visible(kdm_fitted):
+    """A round must say whether the agent left the room it started in.
+
+    "Did it get anywhere?" was unanswerable from the report: a round that never
+    left the starting map and one that crossed three maps looked identical.
+    """
+    env = FakeSpeedrunEnv()
+    out = _make_runner(env, kdm_fitted).run([env], delta=10, timeout_s=30)
+    assert "maps" in out
+    assert len(out["maps"]) == 1
+
+
+def test_map_sampling_tolerates_backends_without_state(kdm_fitted):
+    """The diagnostic must never fail a round on a backend that lacks it."""
+    from ash.env.fake_backend import FakeSpeedrunEnv
+
+    class _NoState(FakeSpeedrunEnv):
+        state = None            # type: ignore[assignment]
+
+    env = _NoState()
+    out = _make_runner(env, kdm_fitted).run([env], delta=5, timeout_s=20)
+    assert out["maps"] == [[]]

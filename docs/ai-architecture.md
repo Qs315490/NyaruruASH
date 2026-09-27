@@ -33,7 +33,7 @@
 | 策略 π（双记忆） | IMPALA-CNN tokenizer + 6 层 causal transformer | `models/ash_policy.py` |
 | 图像 tokenizer φ | ImpalaCNN（随策略训练；论文用冻结 SigLIP，缩放决策见下） | `models/impala_cnn.py` |
 | IDM（双向注意力） | 双帧嵌入 + 拼接差分 + multi-label 头（VPT 风格简化） | `models/idm.py` |
-| 关键时刻分类器 K | HDBSCAN（approximate_predict）+ 多轨迹过滤 | `memory/kdm.py` |
+| 关键时刻分类器 K | HDBSCAN（`approximate_predict`，先 PCA 到 64 维）+ 多轨迹过滤 + 拟合结果缓存 | `memory/kdm.py` |
 | 嵌入（冻结） | DINOv2 ViT-S/14，L2 归一化 | `memory/embeddings.py` |
 | 检索（Algorithm 3） | 贪心一对一窗口匹配，O(w²) 循环的向量化 | `retrieval/matching.py` |
 | 推理（Algorithm 2） | 双记忆 + 卡死计时器 + 逐 4 帧嵌入 | `loop/runner.py` |

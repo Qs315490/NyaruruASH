@@ -56,6 +56,32 @@ class AgentState:
     #: per cluster, otherwise one persistent visual event resets the timer
     #: forever and the agent never reports stuck.
     seen_clusters: set[int] = field(default_factory=set)
+    #: K's verdicts for this round.  A round that reports no key moment has two
+    #: very different explanations - every evaluation landed in noise (the live
+    #: view is outside the corpus' feature space) or they all landed in one
+    #: cluster already seen (the agent is looking at the same thing all round) -
+    #: and the report has to say which one it was.
+    #: Map id sampled during the round (every `map_sample_every` steps when the
+    #: environment can report one).  Without it "did the agent get anywhere?"
+    #: is unanswerable from the report: a round that never left the starting
+    #: room and one that crossed three maps look identical.
+    maps: list[int] = field(default_factory=list)
+    k_evals: int = 0
+    k_noise: int = 0
+    k_in_key_cluster: int = 0
+    k_fired: int = 0
+
+
+def _is_menu_scene(env: Any) -> bool:
+    """True when the backend says the current scene is a known menu template.
+
+    The list lives in agent.js (V.MENU_SCENES); backends that do not implement
+    the hook (the fake one) are never treated as menus."""
+    try:
+        info = env.safety() if hasattr(env, "safety") else {}
+    except Exception:  # noqa: BLE001 - an unreadable scene must abort, not escape
+        return False
+    return bool(info.get("menu"))
 
 
 class InferenceRunner:
@@ -72,6 +98,11 @@ class InferenceRunner:
         device: str = "cpu",
         max_steps: int = 20_000,
         key_moment_cooldown: int = 30,
+        #: How many times one round may back out of a menu with cancel, and how
+        #: many cancel presses each attempt gets.  Both bounded: a scene that
+        #: keeps reappearing is a loop, and a round must end rather than spin.
+        max_menu_escapes: int = 8,
+        max_menu_presses: int = 4,
         frame_skip: int = 1,
         max_confirm_presses: int = 3,
     ) -> None:
@@ -99,12 +130,14 @@ class InferenceRunner:
         # (a cutscene, a menu, a room interior).  Without a cooldown every such
         # frame re-classifies as "new" and the stuck timer never advances.
         self.key_moment_cooldown = key_moment_cooldown
+        self.max_menu_escapes = max(0, int(max_menu_escapes))
+        self.max_menu_presses = max(1, int(max_menu_presses))
 
     # ------------------------------------------------------------------
 
     @staticmethod
     def _scene_gate(envs: list[Any]) -> tuple[str, str | None]:
-        """Classify the current scene: "ok", "confirm" or "abort".
+        """Classify the current scene: "ok", "confirm", "menu" or "abort".
 
         Backends that do not implement the hook (the fake one) are always "ok".
         The CDP backend implements it and fails closed on an unreadable scene,
@@ -126,7 +159,7 @@ class InferenceRunner:
             probe = getattr(env, "is_confirm_scene", None)
             if probe is not None and probe():
                 return "confirm", reason
-            return "abort", reason
+            return "menu" if _is_menu_scene(env) else "abort", reason
         return "ok", None
 
     @staticmethod
@@ -184,7 +217,7 @@ class InferenceRunner:
 
     # ------------------------------------------------------------------
 
-    def random_rollout(self, env: Any, steps: int) -> dict:
+    def random_rollout(self, env: Any, steps: int, seed: int = 0) -> dict:
         """Uniformly random actions, run purely to widen the IDM's coverage.
 
         The paper updates the IDM on the agents' trajectories *supplemented with
@@ -193,16 +226,28 @@ class InferenceRunner:
         label corpus frames whose dynamics it has never observed - which shows
         up as the IDM answering every corpus pair with one constant class.
 
+        `seed` is the round's own: a fixed one made every round replay the SAME
+        action sequence, so the "supplement" re-explored the same hundred steps
+        forever instead of widening coverage.  Within a round it stays
+        deterministic, which is what a replay needs.
+
         The safety gate applies here exactly as it does to the policy round:
         random keystrokes on a menu screen are still menu selections.
         """
-        rng = np.random.default_rng(0)
+        rng = np.random.default_rng(int(seed))
         obs = self._frame(env.reset())
         frames = [obs]
         acts: list[int] = []
         confirms = 0
+        menu_escapes = 0
         for _ in range(max(0, int(steps))):
             kind, reason = self._scene_gate([env])
+            if kind == "menu":
+                if self._leave_menu([env], menu_escapes):
+                    menu_escapes += 1
+                    continue
+                log.error("aborting random-policy rollout: menu did not clear: %s", reason)
+                break
             if kind == "confirm":
                 confirms += 1
                 if confirms > self.max_confirm_presses:
@@ -228,6 +273,7 @@ class InferenceRunner:
         delta: int,
         timeout_s: float = 8 * 3600,
         random_steps: int = 0,
+        random_seed: int = 0,
     ) -> dict:
         """Run all agents until one is stuck (timer >= delta) or max_steps."""
         states = [AgentState(agent_id=i) for i in range(len(envs))]
@@ -239,12 +285,22 @@ class InferenceRunner:
         stuck_seen = False
         abort_reason: str | None = None
         confirms = 0
+        menu_escapes = 0
         while not stuck_seen and time.time() - started < timeout_s:
             # Safety gate, before a single key is dispatched.  In RPG Maker the
             # ok/cancel keys ARE the policy's jump/attack keys, so acting on a
             # title or menu screen commits menu selections: an unattended run
             # pressed Z on the title screen and loaded the player's save.
             kind, reason = self._scene_gate(envs)
+            if kind == "menu":
+                if self._leave_menu(envs, menu_escapes):
+                    menu_escapes += 1
+                    continue
+                # Falling through here would dispatch gameplay keys inside the
+                # menu - the exact thing the gate exists to prevent.
+                abort_reason = "menu scene did not clear with cancel: %s" % reason
+                log.error("aborting inference round: %s", abort_reason)
+                break
             if kind == "confirm":
                 confirms += 1
                 if confirms > self.max_confirm_presses:
@@ -287,15 +343,24 @@ class InferenceRunner:
                     s.short_obs.pop(0)
                     s.short_act.pop(0)
                 s.steps += 1
+                if s.steps % 10 == 0:
+                    self._sample_map(env, s)
                 # Key-moment detection on every observation.  A step is now
                 # control_interval_s of game time, so the stuck timer counts
                 # *steps without a new key moment* - which is what the paper's
                 # Delta means - instead of the old mix of frames and steps.
                 emb = self.kdm.embedder.embed(s.obs[None])[0]
-                if self.kdm.classify(emb, s.seen_clusters):
+                fired, label, is_key_cluster = self.kdm.observe(emb, s.seen_clusters)
+                s.k_evals += 1
+                if label < 0:
+                    s.k_noise += 1
+                elif is_key_cluster:
+                    s.k_in_key_cluster += 1
+                if fired:
                     s.memory.append(s.obs)
                     s.stuck_timer = 0
-                    s.seen_clusters.add(self.kdm.cluster_of(emb))
+                    s.seen_clusters.add(label)
+                    s.k_fired += 1
                 else:
                     s.stuck_timer += 1
                 if s.stuck_timer >= delta:
@@ -308,7 +373,7 @@ class InferenceRunner:
         random_trajectories: list[dict] = []
         if random_steps > 0 and not abort_reason:
             for env in envs:
-                traj = self.random_rollout(env, random_steps)
+                traj = self.random_rollout(env, random_steps, random_seed)
                 if len(traj["act"]):
                     random_trajectories.append(traj)
             log.info(
@@ -327,7 +392,13 @@ class InferenceRunner:
                 for s in states
             ],
             "random_trajectories": random_trajectories,
+            "maps": [list(s.maps) for s in states],
             "memories": [list(s.memory) for s in states],
+            "key_stats": [
+                {"evals": s.k_evals, "noise": s.k_noise,
+                 "in_key_cluster": s.k_in_key_cluster, "fired": s.k_fired}
+                for s in states
+            ],
             "steps": [s.steps for s in states],
             "stuck": stuck_seen,
             #: Non-None when the round stopped for safety instead of getting
@@ -335,6 +406,45 @@ class InferenceRunner:
             #: never mistaken for a converged one.
             "aborted": abort_reason,
         }
+
+    def _sample_map(self, env: Any, state: AgentState) -> None:
+        """Record the current map id, when the backend can report one.
+
+        Best-effort on purpose: the loop must not depend on a diagnostic, and a
+        backend without state() simply reports nothing.
+        """
+        read = getattr(env, "state", None)
+        if read is None:
+            return
+        try:
+            player = (read() or {}).get("player") or {}
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail a round
+            return
+        map_id = player.get("mapId")
+        if map_id is not None and (not state.maps or state.maps[-1] != map_id):
+            state.maps.append(int(map_id))
+
+    def _leave_menu(self, envs: list[Any], escapes: int) -> bool:
+        """Try the cancel-only menu escape.  True when gameplay is reached.
+
+        The escape is bounded per round: a scene that keeps coming back is a
+        loop, not an accident, and the round must end rather than spin.
+        """
+        if escapes >= self.max_menu_escapes:
+            return False
+        for env in envs:
+            escape = getattr(env, "escape_menu", None)
+            if escape is None:
+                return False
+            try:
+                result = escape(max_presses=self.max_menu_presses)
+            except Exception as exc:  # noqa: BLE001 - a failed escape aborts the round
+                log.error("menu escape failed: %s", str(exc)[:160])
+                return False
+            log.warning("escaped a menu with %d cancel press(es): %s",
+                        result.get("presses"), result.get("scene"))
+            return bool(result.get("escaped"))
+        return False
 
     def _seen_clusters(self, state: AgentState) -> set[int]:
         """Clusters already matched earlier in this trajectory (O(1) read).

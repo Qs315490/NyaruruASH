@@ -16,6 +16,7 @@ for step 3 (see bootstrap.py).  This module is the wiring, the paper's
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -82,8 +83,17 @@ class Orchestrator:
         self.config.out_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self) -> dict:
-        """Run the full self-hone cycle until a stopping condition fires."""
-        history: list[dict] = []
+        """Run the full self-hone cycle until a stopping condition fires.
+
+        The report is written to disk after every stage instead of only at the
+        end.  A run that dies in the bootstrap - the long part - used to leave
+        nothing at all, so the round's inference statistics were lost with it
+        and there was no way to tell whether the round had seen a single key
+        moment.  `bootstrap_pending` marks a round whose bootstrap never
+        finished.
+        """
+        report_doc: dict[str, Any] = {"rounds": [], "bootstraps": 0, "done": False}
+        history: list[dict] = report_doc["rounds"]
         while self.bootstrap_round < self.config.max_bootstraps:
             started = time.time()
             result = self.runner(
@@ -92,6 +102,9 @@ class Orchestrator:
                 delta=self.config.delta,
                 timeout_s=self.config.round_timeout_s,
                 random_steps=self.config.random_steps,
+                # Different exploration every round: a fixed seed replayed the
+                # same hundred actions forever and never widened coverage.
+                random_seed=self.bootstrap_round,
             )
             trajectories = result["trajectories"]          # list of {"obs","act"}
             random_trajectories = result.get("random_trajectories", [])
@@ -100,6 +113,15 @@ class Orchestrator:
                 "stuck": result.get("stuck"),
                 "key_moments": [len(m) for m in result.get("memories", [])],
                 "aborted": result.get("aborted"),
+                # K's verdicts, so a round with no key moment says which kind of
+                # nothing it was: all noise, or all one already-seen cluster.
+                "key_stats": result.get("key_stats"),
+                "maps": result.get("maps"),
+                # How close the round's own frames got to the corpus.  Corpus
+                # frames sit ~0.93 cosine from their nearest corpus frame; a live
+                # view far below that is out of distribution, and no threshold or
+                # refit will make K fire on it.
+                "best_corpus_cosine": self._best_corpus_cosine(trajectories),
             }
             log.info(
                 "inference round %d: %d agents, stats=%s (%.0fs)",
@@ -122,8 +144,18 @@ class Orchestrator:
             d_r = [vid for vid, _ in sorted(vid_rank.items(), key=lambda kv: kv[1])]
             log.info("retrieved %d videos for bootstrap: %s", len(d_r), d_r)
 
+            entry: dict[str, Any] = {
+                "round": self.bootstrap_round,
+                "retrieved": d_r,
+                "stats": seen_stats,
+                "bootstrap_pending": True,
+            }
+            history.append(entry)
+            self._save_round_frames(entry["round"], trajectories)
+            self.write_report(report_doc)
+
             # Step 3: bootstrap K, IDM, pi.
-            report = self.bootstrap_fn(
+            entry.update(self.bootstrap_fn(
                 policy=self.policy,
                 idm=self.idm,
                 kdm=self.kdm,
@@ -131,13 +163,67 @@ class Orchestrator:
                 random_trajectories=random_trajectories,
                 retrieved_ids=d_r,
                 out_dir=self.config.out_dir / f"bootstrap-{self.bootstrap_round:03d}",
-            )
-            report["round"] = self.bootstrap_round
-            report["retrieved"] = d_r
-            report["stats"] = seen_stats
-            history.append(report)
+            ))
+            entry.pop("bootstrap_pending", None)
             self.bootstrap_round += 1
-        return {"rounds": history, "bootstraps": self.bootstrap_round}
+            report_doc["bootstraps"] = self.bootstrap_round
+            self.write_report(report_doc)
+        report_doc["done"] = True
+        self.write_report(report_doc)
+        return report_doc
+
+    @staticmethod
+    def _sample_frames(trajectory: dict, limit: int = 64) -> np.ndarray:
+        """Up to `limit` frames spread across a round.  Kept small on purpose:
+        this is for looking at what the round saw, not for training."""
+        obs = np.asarray(trajectory["obs"])
+        if not len(obs):
+            return obs
+        step = max(1, len(obs) // limit)
+        return obs[::step][:limit]
+
+    def _save_round_frames(self, round_index: int, trajectories: list) -> None:
+        """Write a sample of the round's frames next to its report.
+
+        Without this there is no way to answer "why did K see nothing?" after
+        the fact: the embeddings are gone, the game has moved on, and a later
+        capture of a paused game is a frozen frame.  That dead end cost three
+        separate attempts before this existed.
+        """
+        if not trajectories:
+            return
+        frames = self._sample_frames(trajectories[0])
+        if not len(frames):
+            return
+        path = self.config.out_dir / f"round-{round_index:03d}-frames.npz"
+        try:
+            np.savez_compressed(path, frames=frames)
+        except OSError as exc:  # a diagnostic must never fail the run
+            log.warning("could not write %s: %s", path, exc)
+
+    def _best_corpus_cosine(self, trajectories: list) -> float | None:
+        """Best cosine between the round's own frames and any corpus frame.
+
+        Sampled, not exhaustive: the answer is a distribution check, and the
+        full product over 68440 corpus frames per trajectory is a second copy of
+        the retrieval pass for a number that moves by ~1e-3.
+        """
+        if not self.corpus_index or not trajectories:
+            return None
+        obs = np.asarray(trajectories[0]["obs"])
+        if not len(obs):
+            return None
+        step = max(1, len(obs) // 32)
+        emb = self.embedder.embed(obs[::step])
+        return max(float((emb @ mat.T).max()) for _, mat in self.corpus_index)
+
+    def write_report(self, document: dict) -> None:
+        """Persist the report, atomically so a kill cannot leave half a file."""
+        path = self.config.out_dir / "loop-report.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(document, indent=2, default=str))
+        tmp.replace(path)
 
 
 def load_or_init_policy(path: str | None, config: Any) -> AshPolicy:

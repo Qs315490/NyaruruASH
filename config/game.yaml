@@ -69,7 +69,9 @@ keymap:
     names: [x]
     codes: [KeyX]
     keycodes: [88]
-  dash:            # 游戏内「冲刺」= C
+  dash:            # 游戏内「冲刺」= C（用户确认）。注意引擎的 Input.keyMapper 把
+                   # 67(C) 映射成内部名 "bullet"，那只是内部命名，不是「发射子弹」——
+                   # 不要因为这个名字去改这里的绑定。
     names: [c]
     codes: [KeyC]
     keycodes: [67]
@@ -93,6 +95,10 @@ keymap:
     names: [a]
     codes: [KeyA]
     keycodes: [65]
+  item:            # 游戏内「使用物品」= F（就地使用当前选中物品；唯一的即时回血手段）
+    names: [f]
+    codes: [KeyF]
+    keycodes: [70]
   weapon_switch:   # 游戏内「更换武器」= S；切换咸鱼武器
     #   引擎核实：Game_Player.controlWeaponChange() 读输入名 "cfish"，
     #   而 keyMapper 里 83(KeyS) -> "cfish"。所以 S 是切换键，

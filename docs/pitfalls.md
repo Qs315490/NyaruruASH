@@ -123,19 +123,30 @@
     修法：自博弈用 `drive="realtime"`（不装帧泵、按真实时间按持键），帧泵只留给确定性回放。
     `tests/test_drive_mode.py` 钉死。
 
-18. **「角色动不了」可能是「站在空地图上」——而这是第三次因为「没追一条已有的证据」
-    而误判**。这次实测：`$gamePlayer` 停在 `map 4`（11×9、`tilesetId=0`、`displayName` 为空、
-    **99 个图块里 0 个有图形**、note 里是 `<layer name:Map004-shadow,...>`），也就是这个游戏
-    内部的**过渡/阴影空地图**。在空地图上谁都走不动，`isMoving()` 恒 false、坐标恒不变，
-    连玩家自己用键盘也一样。
-    教训：**`tileId`/`isPassable` 这类「周围环境」证据要第一时间追下去**。我在很早就量到
-    「六个 tile 图层全 0」，却把它当成无关细节跳过了，随后又花了好几轮去怀疑输入通路、
-    怀疑 CDP 事件、怀疑帧泵。当时的正确动作是：一旦怀疑「输入没生效」，就先确认
-    **角色所在的地图是否存在**。
-    排查口诀：`$gameMap.width()/height()/tilesetId` + 全图图块计数；`$gamePlayer.canMove()`；
-    `$gameMap._interpreter.isRunning()` + `$gameMessage.isBusy()`；`Graphics.app.ticker.started`。
-    这四项任一异常，就是「环境问题」而不是「输入问题」。
-    出口：这个游戏自带 `Utils.backToTown()`（实测能回到城镇地图 6 @ (11,9)）。
+18. **不要用 `$gamePlayer.x/y` 判断角色有没有动——这个游戏不用它。**
+    **我因此连续误判了三次，还写过一条错误的「空地图」结论（已删）。**
+    实测（30 秒连续采样，玩家自己用键盘走动）：
+
+    | 字段 | 30 秒内 |
+    | --- | --- |
+    | 角色精灵的 `sprite.x/y`、`$gamePlayer.screenX()/screenY()` | **持续变化**（715→718→719→711→645→573→531→459→…→594）|
+    | `$gamePlayer.x/y`、`_realX/_realY`、`$gameMap._displayX/_displayY` | **全程不变** |
+
+    这是**动作平台游戏**：角色用自由像素坐标移动，位置记在**精灵**上，MZ 的格子坐标
+    `x/y` 只是一个固定锚点，**永远不会随移动更新**（`$gamePlayer.moveByInput` 也被改成
+    空函数）。所以「读 x/y 看角色动没动」是一条**永远返回「没动」的死路**。
+    **正确做法：`$gamePlayer.screenX()/screenY()`，或 `_spriteset` 里那个
+    `sprite._character === $gamePlayer` 的精灵的 `x/y`。**
+    另一条**不是**证据的现象：`$dataMap.tilesetId === 0` 且全图图块为 0 在这里是**正常**的
+    ——这个游戏的地图用**插件图层/图片**绘制（note 里就有 `<layer name:Map004-shadow,...>`），
+    不走 MZ 图块数据。我把它误当成「空地图/损坏」，浪费了好几轮。
+
+    排查顺序（先排除环境，再怀疑输入）：
+    1. `Graphics.app.ticker.started` —— false 表示游戏被暂停（我的 `close()` 刻意会停它）；
+    2. `$gameMap._interpreter.isRunning()` / `$gameMessage.isBusy()` —— 事件/对话进行中时
+       `canMove()` 按设计返回 false；
+    3. **用 `screenX()/screenY()` 观测角色是否移动**（不要用 `x/y`）；
+    4. 只有以上都正常，才去怀疑输入通路。
 
 ## 历史踩坑实录（详见 docs/game-architecture.md）
 

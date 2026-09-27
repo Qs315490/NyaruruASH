@@ -18,6 +18,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -163,6 +164,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the player's save.
         if args.backend == "cdp":
             reason = probe_env.unsafe_reason()
+            if reason and _is_menu_scene(probe_env):
+                # An agent that walked into a menu can back out with cancel on
+                # its own, so a previous run's accident is not a reason to refuse
+                # to start.  This presses cancel ONLY (never ok, never a
+                # direction) and only on a scene agent.js lists as a menu.
+                escaped = probe_env.escape_menu(max_presses=6)
+                log.info("menu escape before start: %s", escaped)
+                reason = probe_env.unsafe_reason()
             if reason and not probe_env.is_confirm_scene():
                 log.error("refusing to start a live run: %s", reason)
                 print(
@@ -183,12 +192,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     idm = load_or_init_idm(args.idm, _idm_config(args, len(action_space)))
 
     from ash.memory.embeddings import FrameEmbedder
-    from ash.memory.kdm import KeyMomentModel
 
     device = str(resolve_device(args.device))
     embedder = FrameEmbedder(device)
-    kdm = KeyMomentModel()
-    kdm.embedder = embedder
 
     # The corpus is embedded exactly once and the result serves both consumers:
     # K is fit on these embeddings (the paper derives K from the internet corpus
@@ -200,21 +206,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # classify() on every 4th frame; the first bootstrap only runs after a whole
     # round of inference has finished, which is too late.
     index = _corpus_embeddings(args.corpus_index, args.corpus, embedder)
-    if index:
-        n_frames = sum(len(e) for _, e in index)
-        log.info("fitting key-moment model on %d frames from %d corpus videos",
-                 n_frames, len(index))
-        kdm.fit(
-            np.concatenate([e for _, e in index]),
-            [vid for vid, e in index for _ in range(len(e))],
-        )
-    else:
-        log.warning(
-            "no corpus under %s: key-moment discovery is unfitted, so every "
-            "frame counts as noise and the agent will report stuck immediately. "
-            "Run scripts/build_corpus.py first for a real run.",
-            args.corpus,
-        )
+    kdm = _key_moment_model(args, embedder, index)
 
     def runner(**kw):
         envs = [_make_env(args.backend) for _ in range(args.num_agents)]
@@ -235,6 +227,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 delta=kw["delta"],
                 timeout_s=kw["timeout_s"],
                 random_steps=kw.get("random_steps", 0),
+                random_seed=kw.get("random_seed", 0),
             )
         finally:
             for e in envs:
@@ -254,6 +247,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             retrieved_ids=kw.get("retrieved_ids"),
             # Random-policy samples for IDM dynamics coverage (paper Alg 4).
             random_trajectories=kw.get("random_trajectories"),
+            # The retrieval index already holds every corpus video's DINOv2
+            # matrix; without it the bootstrap re-embeds D^R twice per round.
+            corpus_embeddings=dict(index),
         )
 
     log.info("retrieval index: %d videos", len(index))
@@ -281,6 +277,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_menu_scene(env) -> bool:
+    """True when the env reports a known menu template (agent.js V.MENU_SCENES)."""
+    try:
+        return bool((env.safety() or {}).get("menu"))
+    except Exception:  # noqa: BLE001 - an unreadable scene must abort, not escape
+        return False
+
+
 def _policy_config(args, num_actions: int):
     """Policy config whose head width is the env's action space size.
 
@@ -300,6 +304,95 @@ def _idm_config(args, num_actions: int):
     return IdmConfig(image_size=args.image_size, num_actions=num_actions)
 
 
+def _key_moment_model(args, embedder: Any, index: list[tuple[str, np.ndarray]]):
+    """K, fit on the internet corpus D^I - reused from a cache when possible.
+
+    Fitting is deterministic given the corpus and the hyperparameters, so a
+    cached fit is equivalent to a fresh one (the tests pin that a reloaded
+    model answers identically).  It is cached because it is minutes of CPU that
+    every run otherwise pays for before the game is even touched: 113 s for the
+    six-video corpus after the PCA reduction.
+
+    K must exist before the first inference step because runner.run() calls
+    classify() on every 4th frame; the first bootstrap only runs after a whole
+    round of inference has finished, which is too late.
+    """
+    from ash.memory.kdm import KeyMomentModel
+
+    kdm = KeyMomentModel()
+    kdm.embedder = embedder
+    if not index:
+        log.warning(
+            "no corpus under %s: key-moment discovery is unfitted, so every "
+            "frame counts as noise and the agent will report stuck immediately. "
+            "Run scripts/build_corpus.py first for a real run.",
+            args.corpus,
+        )
+        return kdm
+
+    cache = _kdm_cache_path(args)
+    meta = _kdm_fingerprint(args, kdm, embedder)
+    cached = KeyMomentModel.load(cache, meta)
+    if cached is not None:
+        cached.embedder = embedder
+        log.info("loaded key-moment model from %s (%d kept clusters)",
+                 cache, len(cached._kept))
+        return cached
+
+    n_frames = sum(len(e) for _, e in index)
+    log.info("fitting key-moment model on %d frames from %d corpus videos",
+             n_frames, len(index))
+    report = kdm.fit(
+        np.concatenate([e for _, e in index]),
+        [vid for vid, e in index for _ in range(len(e))],
+    )
+    log.info("key-moment model: %s", report)
+    kdm.save(cache, meta)
+    log.info("wrote key-moment model to %s", cache)
+    return kdm
+
+
+def _kdm_cache_path(args) -> Path:
+    """Sibling of the corpus dir, for the same reason as the embedding cache:
+    the loader globs `*.npz` inside the corpus directory, so nothing the run
+    produces may be written there."""
+    if getattr(args, "kdm_cache", None):
+        return Path(args.kdm_cache)
+    base = Path(args.corpus or "data/corpus")
+    return base.parent / (base.name + "-kdm.pkl")
+
+
+def _kdm_fingerprint(args, kdm: Any, embedder: Any) -> str:
+    """Everything a cached K depends on.
+
+    Includes the clusterer libraries' versions: the pickle stores a fitted
+    HDBSCAN, and approximate_predict is the code that runs at every inference
+    step, so a version bump must invalidate the file rather than be trusted.
+    """
+    import sklearn
+
+    return json.dumps(
+        {
+            "v": 1,
+            "corpus": _corpus_fingerprint(args.corpus, embedder.image_size),
+            "params": kdm.hyperparameters(),
+            "hdbscan": _dist_version("hdbscan"),
+            "sklearn": getattr(sklearn, "__version__", _dist_version("scikit-learn")),
+        },
+        sort_keys=True,
+    )
+
+
+def _dist_version(name: str) -> str:
+    """hdbscan exposes no __version__, so read the installed metadata."""
+    import importlib.metadata as md
+
+    try:
+        return md.version(name)
+    except Exception:  # noqa: BLE001 - a missing version must not break a run
+        return "unknown"
+
+
 def _corpus_embeddings(
     path: str | None,
     corpus_dir: str | None,
@@ -315,19 +408,41 @@ def _corpus_embeddings(
     directory: the loader globs `*.npz` there, so a cache written next to the
     videos would be picked up on the next run as a corpus video named "index".
     """
-    if path and Path(path).exists():
-        with np.load(path) as data:
-            return [(k, data[k]) for k in data.files]
+    base = Path(corpus_dir or "data/corpus")
+    cache = Path(path) if path else base.parent / (base.name + "-embeddings.npz")
+    stamp = _corpus_fingerprint(corpus_dir, embedder.image_size)
+    if cache.exists():
+        with np.load(cache, allow_pickle=False) as data:
+            meta = data["__meta__"] if "__meta__" in data.files else None
+            if meta is not None and str(meta) == stamp:
+                videos = [(k, data[k]) for k in data.files if k != "__meta__"]
+                log.info("loaded retrieval index from %s (%d videos)", cache, len(videos))
+                return videos
+            # A stale index does not fail loudly: retrieval just scores against
+            # the wrong frames.  Say why it is being rebuilt instead of silently
+            # reusing it.
+            log.warning("retrieval index cache %s is stale or unversioned; rebuilding", cache)
     out: list[tuple[str, np.ndarray]] = []
     for vid, frames in _corpus_loader(corpus_dir)():
         if len(frames):
             out.append((vid, embedder.embed(frames)))
     if out:
-        base = Path(corpus_dir or "data/corpus")
-        cache = base.parent / (base.name + "-embeddings.npz")
-        np.savez_compressed(cache, **dict(out))
-        log.info("wrote retrieval index to %s", cache)
+        np.savez_compressed(cache, __meta__=np.array(stamp), **dict(out))
+        log.info("wrote retrieval index to %s (%d videos)", cache, len(out))
     return out
+
+
+def _corpus_fingerprint(corpus_dir: str | None, image_size: int) -> str:
+    """Cheap identity of the corpus + embedding resolution, for the cache.
+
+    Uses file names and sizes rather than loading the frames: the point is to
+    notice that the corpus changed, and reading 3 GB of npz to find that out
+    would cost more than the embeddings it guards.
+    """
+    base = Path(corpus_dir or "data/corpus")
+    files = sorted((p.name, p.stat().st_size) for p in base.glob("*.npz"))
+    return json.dumps({"v": 1, "image_size": int(image_size), "files": files},
+                      sort_keys=True)
 
 
 def _corpus_loader(corpus_dir: str | None):
@@ -370,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--idm", default=None, help="existing IDM checkpoint")
     r.add_argument("--corpus", default="data/corpus", help="internet video corpus dir")
     r.add_argument("--corpus-index", default=None, help="precomputed embedding index json")
+    r.add_argument("--kdm-cache", default=None,
+                   help="fitted key-moment model cache (default: beside the corpus)")
     r.add_argument("--delta", type=int, default=600, help="stuck threshold in steps")
     r.add_argument("--num-agents", type=int, default=1)
     r.add_argument("--image-size", type=int, default=128)

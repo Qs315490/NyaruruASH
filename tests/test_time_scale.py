@@ -33,7 +33,7 @@ class _NoKeyMoments:
     """A K that never fires, so the runner's loop can be tested without HDBSCAN.
 
     It also documents the two calls the runner makes: embed the observation,
-    then ask classify().  Returning "no" keeps the episode running instead of
+    then ask observe().  Returning "no" keeps the episode running instead of
     resetting the stuck timer, which is what a working-but-unmatched K looks
     like.
     """
@@ -44,11 +44,11 @@ class _NoKeyMoments:
 
     embedder = _Emb()
 
-    def classify(self, embedding, seen_clusters):
-        return False
+    def observe(self, embedding, seen_clusters):
+        return False, -1, False
 
-    def cluster_of(self, embedding):
-        return -1
+    def classify_sequence(self, embeddings):
+        return np.zeros(len(embeddings), dtype=bool)
 
     def fit(self, embeddings, trajectory_ids):
         return {"clusters_total": 0, "clusters_kept": 0, "noise_rate": 1.0}
@@ -195,3 +195,20 @@ def test_bootstrap_counts_agent_and_random_transitions(tmp_path):
 
     assert report["idm"]["agent_transitions"] == 7
     assert report["idm"]["random_transitions"] == 5
+
+
+def test_random_rollout_varies_between_rounds():
+    """The supplement must explore something new each round.
+
+    A hard-coded seed replayed the identical action sequence in every round, so
+    the "random-policy samples" the paper adds to the IDM's training set never
+    widened beyond the same hundred steps.
+    """
+    env = FakeSpeedrunEnv()
+    runner = _runner(env, frame_skip=4)
+    a = runner.random_rollout(env, 12, seed=0)["act"]
+    b = runner.random_rollout(env, 12, seed=1)["act"]
+    c = runner.random_rollout(env, 12, seed=0)["act"]
+    assert len(a) == len(b) == 12
+    assert not np.array_equal(a, b), "a new round must explore differently"
+    assert np.array_equal(a, c), "the same round must replay identically"
