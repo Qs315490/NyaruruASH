@@ -241,6 +241,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # made the IDM learn 1/60 s dynamics and apply them to frames
                 # 2 s apart.
                 frame_skip=game.control_frame_skip,
+                # Off by default: releasing every step is the safe contract.  On,
+                # an action keeps its buttons down until the action changes, which
+                # is the only way this game's variable-height jump and its
+                # double jump (release at the apex, press again) are expressible.
+                hold_actions=bool(getattr(args, "hold_actions", False)),
             )
             return r.run(
                 envs,
@@ -840,6 +845,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--delta", type=int, default=600, help="stuck threshold in steps")
     r.add_argument("--num-agents", type=int, default=1)
     r.add_argument("--image-size", type=int, default=128)
+    r.add_argument(
+        "--hold-actions", action="store_true",
+        help="keep an action's buttons down until the action changes; required for "
+             "variable-height jumps and for the double jump (release at the apex, "
+             "press again), neither of which one-step-then-release can express",
+    )
     r.add_argument("--device", default=None)
     r.add_argument("--max-steps", type=int, default=20_000)
     #: The self-hone loop has no natural termination (the paper runs until the

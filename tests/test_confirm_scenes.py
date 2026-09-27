@@ -56,12 +56,20 @@ def _confirm_scenes() -> list[str]:
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-#: The scenes whose ok is PROVEN to do exactly one thing.  `Scene_ItemObtain`
-#: binds pressOk to popScene (nya_game.js), so ok closes the popup and commits
-#: nothing; a live run aborted the whole rollout on it because it was unlisted
-#: ("scene 'Scene_ItemObtain' is not Scene_Map gameplay"), stalling the agent
-#: every time it picked an item up.
-PROVEN = {"Scene_ItemObtain"}
+#: The scenes whose ok is PROVEN to do exactly one thing.
+#:
+#: `Scene_ItemObtain` binds pressOk to popScene (nya_game.js), so ok closes the
+#: popup and commits nothing; a live run aborted the whole rollout on it because
+#: it was unlisted ("scene 'Scene_ItemObtain' is not Scene_Map gameplay"),
+#: stalling the agent every time it picked an item up.
+#:
+#: `Scene_HardGuide` is the same shape: Sprite_HardGuide.updateInput calls
+#: pressOk on Input.isAnyTriggered(), createGuide binds pressOk to popScene, and
+#: terminate() clears the guide flag.  It is a hint popup pushed from Scene_Map
+#: gameplay, with no list and no paging.  Leaving it out cost whole collection
+#: rounds - a 2000-step rollout ended after 196 steps with "scene
+#: 'Scene_HardGuide' is not Scene_Map gameplay".
+PROVEN = {"Scene_ItemObtain", "Scene_HardGuide"}
 
 
 def test_only_proven_popups_are_allow_listed():
@@ -71,8 +79,11 @@ def test_only_proven_popups_are_allow_listed():
 
 def test_an_unproven_popup_is_not_allow_listed():
     """Adding a scene because it looks harmless is the Scene_Transport mistake."""
-    for guess in ("Scene_Popup", "Scene_HardGuide", "Scene_AdWaiting",
-                  "Scene_NotificationBar", "Scene_Story", "Scene_Staff"):
+    # Scene_HardGuide used to sit in this list and was correctly refused.  It
+    # graduated because the game's own source proves its ok closes a one-shot
+    # hint popup (see PROVEN), not because the screen looked harmless.
+    for guess in ("Scene_Popup", "Scene_AdWaiting", "Scene_NotificationBar",
+                  "Scene_Story", "Scene_Staff", "Scene_Transport"):
         assert guess not in _confirm_scenes(), guess
 
 

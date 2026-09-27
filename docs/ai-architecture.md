@@ -4,6 +4,11 @@
 (arXiv 2605.14211v3)。本文件说明每个模块对应论文的哪部分、规模缩放决策、
 以及数据流。
 
+> **本文描述的是设计与接线**（怎么接、为什么这么缩放）。**哪些部分已经在真机上成立、
+> 哪些被实测否证**，见 [`status.md`](status.md)——那里是唯一的证据链与决策记录。
+> 特别是：**π 的学习信号（IDM 伪标签）实测不可用**，所以 Alg 4 的后半段在实务上
+> 没有成立。
+
 ## 自精进循环（Algorithm 1）
 
 ```
@@ -32,7 +37,7 @@
 | --- | --- | --- |
 | 策略 π（双记忆） | IMPALA-CNN tokenizer + 6 层 causal transformer | `models/ash_policy.py` |
 | 图像 tokenizer φ | ImpalaCNN（随策略训练；论文用冻结 SigLIP，缩放决策见下） | `models/impala_cnn.py` |
-| IDM（双向注意力） | 双帧嵌入 + 拼接差分 + multi-label 头（VPT 风格简化） | `models/idm.py` |
+| IDM（双向注意力） | 双帧嵌入 + 拼接差分 + **动作空间分类头（20 类 CE）** | `models/idm.py` |
 | 关键时刻分类器 K | HDBSCAN（`approximate_predict`，先 PCA 到 64 维）+ 多轨迹过滤 + 拟合结果缓存 | `memory/kdm.py` |
 | 嵌入（冻结） | DINOv2 ViT-S/14，L2 归一化 | `memory/embeddings.py` |
 | 检索（Algorithm 3） | 贪心一对一窗口匹配，O(w²) 循环的向量化 | `retrieval/matching.py` |
@@ -56,18 +61,25 @@
 ## 数据流与格式
 
 - 观测：`(T, H, W, C)` uint8 RGB。语料 npz 键 `frames`。
-- 动作：multi-hot 掩码，17 物理键（`config/keys.yaml`）→ 运行时动作空间
-  28 项（`actions/space.py`）。IDM 输出 17 键掩码，策略输出 28 项分布——
-  **两者维度不同是设计如此**，接线时必须在键序上对齐（历史上 logit 下标
-  错位的教训）。
+- 动作：multi-hot 掩码，14 个按钮（`actions/space.py: BUTTONS`，键位见 `config/keys.yaml`）
+  → 运行时动作空间 **20 项**（`ActionSpace.minimal()`）。**IDM 是动作空间上的分类器**
+  （20 类），**不是**多标签按键预测器；策略头也是 20 类分布。两个头的宽度都必须等于
+  `len(action_space)`（`DEFAULT_NUM_ACTIONS`），历史上 17 / 28 / 13 三个数字各不相同，
+  第一次自举就炸成 `addmm: shapes cannot be multiplied (256x17 and 28x256)`。
+  **动作空间只能追加、不能插入**：下标是写进轨迹/日志/checkpoint 的标签，
+  `tests/test_action_space.py` 钉死。
 - 长期记忆 ρ：最近 w_l 个关键时刻观测（每 agent 追加式 memory bank）。
 - 短期记忆：最近 w_s 个 (obs, action) 对；窗口左端不足时重复最早帧填充。
 
 ## 语料
 
-`data/corpus/*.npz`：速通视频经 yt-dlp 下载、抽帧（建议 20 fps 采样、
-统一缩放到模型输入分辨率）打包。检索索引用 DINOv2 以 2 秒间隔嵌入
-（论文设定），可预计算成 json 索引（`--corpus-index`）。
+`data/corpus/*.npz`（或 `scripts/pack_corpus.py` 转出的未压缩 `.npy` mmap，loader 优先用
+后者——匿名内存不可回收，而 mmap 的页可以）：速通视频经 yt-dlp 下载、ffmpeg 抽帧
+（**抽帧率由 `config/game.yaml:control_interval_s` 派生**，当前 0.25 s → **4 fps**，
+与 agent 步长同源；**不要写死第二处**，`tests/test_time_scale.py` 钉死）、
+统一缩放到模型输入分辨率打包。检索索引用 DINOv2 嵌入，可预计算缓存
+（`--corpus-embeddings`）。**抓来的视频要按 `data/corpus-crops.json` 裁掉叠加层**
+（`scripts/detect_game_rect.py --write` 生成；实测余弦 0.8249 → 0.9375）。
 
 **抓来的速通视频当不了 K 的锚点（实测 2026-09-25，`scripts/measure_corpus_crop.py`）**：
 K 在语料上聚类，实机帧要落进这些簇才会触发关键时刻。但抓来的帧与实机帧的余弦只有

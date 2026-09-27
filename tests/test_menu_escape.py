@@ -47,7 +47,7 @@ def test_menu_and_confirm_lists_are_disjoint():
     lists = _lists()
     # An entry now exists - Scene_ItemObtain, whose ok the game binds to popScene -
     # but the two lists answer different questions and still must not overlap.
-    assert lists["confirm"] == ["Scene_ItemObtain"], lists["confirm"]
+    assert lists["confirm"] == ["Scene_ItemObtain", "Scene_HardGuide"], lists["confirm"]
     assert not set(lists["menu"]) & set(lists["confirm"])
     assert "Scene_SkillSt" in lists["menu"], "this is the scene that trapped a real round"
 

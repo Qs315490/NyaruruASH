@@ -27,6 +27,7 @@ import torch
 from torch import nn
 
 from ash.actions.space import ActionSpace, buttons_from_mask
+from ash.data.effect import describe_effects
 from ash.memory.kdm import KeyMomentModel
 from ash.models.ash_policy import AshPolicy, save_policy
 from ash.models.idm import IdmModel, save_idm
@@ -64,6 +65,23 @@ class BootstrapConfig:
     #: (policy_val ~1e-6) reads exactly like convergence.  Skipping the update
     #: and saying so is strictly better than destroying the policy quietly.
     max_pseudo_majority: float = 0.9
+
+
+def _transition_motion(trajectories: list) -> list[float]:
+    """Per-transition mean absolute pixel change, in `describe_effects` order.
+
+    The frames are already in memory here, so this is a cheap pass; it exists to
+    separate "the picture changed" from "the player moved", which are different
+    questions and the difference is the whole point of keeping engine state.
+    """
+    out: list[float] = []
+    for traj in trajectories:
+        obs = np.asarray(traj.get("obs"))
+        if len(obs) < 2:
+            continue
+        d = np.abs(obs[1:].astype(np.int16) - obs[:-1].astype(np.int16))
+        out.extend((d.mean(axis=(1, 2, 3)) / 255.0).tolist())
+    return out
 
 
 def action_names(num_actions: int) -> list[str]:

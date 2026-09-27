@@ -50,6 +50,11 @@ class AgentState:
     #: labels (paper Algorithm 4 step 2), so they are recorded, not
     #: reconstructed from the policy indices afterwards.
     actions: list[int] = field(default_factory=list)
+    #: The engine's own readout per step, parallel to `trajectory`.  Pixels alone
+    #: cannot separate "the world scrolled" from "the player took a step", while
+    #: the game's physics plugin exposes the player's own position and velocity.
+    #: Training-time only: the delivered policy sees pixels.  See data/effect.py.
+    states: list[dict] = field(default_factory=list)
     stuck_timer: int = 0
     steps: int = 0
     #: cluster ids matched earlier in this trajectory; K must only fire once
@@ -107,14 +112,27 @@ class InferenceRunner:
         #: operator's preset.  Small: the pick appears once, and a dialogue that
         #: keeps asking is a loop the round must end on rather than spin in.
         max_difficulty_resolves: int = 3,
+        #: Death plus a save load is part of playing, and each death used to end
+        #: the round.  Bounded because a screen that keeps reappearing is a loop
+        #: the round must end on rather than spin in.
+        max_gameover_resolves: int = 8,
         frame_skip: int = 1,
         max_confirm_presses: int = 3,
+        #: Keep the buttons down across steps instead of releasing every step.
+        #: Jump height here is set by how long the key is held (measured: one
+        #: 250 ms step reaches 172 px of the 212 the game allows), and the second
+        #: jump needs a release at the apex - neither is expressible while every
+        #: step releases.  With this on, repeating an action lengthens the hold
+        #: and switching action releases it, so both become policy choices
+        #: instead of hard-coded sequences.
+        hold_actions: bool = False,
     ) -> None:
         #: Upper bound on ok presses spent clearing an input-gated scene.  Bounded
         #: because a screen that does not clear after a couple of oks is not a
         #: transition screen, and pressing on would be exactly the "press and
         #: hope" behaviour the gate exists to prevent.
         self.max_confirm_presses = max(0, int(max_confirm_presses))
+        self.hold_actions = bool(hold_actions)
         self.env_factory = env_factory
         self.policy = policy.to(device).eval()
         self.kdm = kdm
@@ -136,6 +154,7 @@ class InferenceRunner:
         self.key_moment_cooldown = key_moment_cooldown
         self.max_menu_escapes = max(0, int(max_menu_escapes))
         self.max_difficulty_resolves = max(0, int(max_difficulty_resolves))
+        self.max_gameover_resolves = max(0, int(max_gameover_resolves))
         self.max_menu_presses = max(1, int(max_menu_presses))
 
     # ------------------------------------------------------------------
@@ -172,8 +191,38 @@ class InferenceRunner:
             probe = getattr(env, "is_confirm_scene", None)
             if probe is not None and probe():
                 return "confirm", reason
+            # GAME OVER with the cursor off the save load.  The screen is not a
+            # choice this layer may answer, but it is also the one place where
+            # giving up costs the whole round: measured, a 2500-step collection
+            # ended after 1314 steps on it.  The backend may move the cursor onto
+            # the allowed entry and commit THAT, which is the same recovery a
+            # human performs.
+            probe = getattr(env, "gameover_recovery_pending", None)
+            if probe is not None and probe():
+                return "gameover", reason
             return "menu" if _is_menu_scene(env) else "abort", reason
         return "ok", None
+
+    @staticmethod
+    def _resolve_gameover(envs: list[Any]) -> bool:
+        """Press the save-load entry on the game over screen.  Verified, bounded.
+
+        Returns True only when the backend re-read the scene and saw it leave
+        GAME OVER.  A failure returns False and the caller aborts the round:
+        falling through would dispatch gameplay keys onto a screen where ok
+        commits a choice, which is what the gate exists to prevent.
+        """
+        for env in envs:
+            resolve = getattr(env, "resolve_gameover", None)
+            if resolve is None:
+                continue
+            out = resolve()
+            if out.get("resolved"):
+                log.info("game over: loaded the save in %s presses (now %s)",
+                         out.get("presses"), out.get("scene"))
+                return True
+            log.error("game over: could not load the save: %s", out.get("reason"))
+        return False
 
     @staticmethod
     def _resolve_difficulty(envs: list[Any]) -> bool:
@@ -203,6 +252,49 @@ class InferenceRunner:
         obs = getattr(result, "obs", result)
         rgb = getattr(obs, "rgb", obs)
         return np.asarray(rgb, dtype=np.uint8)
+
+    def _step(self, env: Any, mask: int) -> Any:
+        """One action step, releasing the buttons only when they changed.
+
+        With `hold_actions` on, the environment keeps a pressed key down, so
+        repeating an action asks the game to keep holding it; switching action
+        makes the environment lift the old buttons first.  Backends without the
+        held-input API (the fake one) fall back to the plain step.
+        """
+        if not self.hold_actions or not hasattr(env, "step_holding"):
+            return env.step(mask, frames=self.frame_skip)
+        return env.step_holding(mask, frames=self.frame_skip)
+
+    @staticmethod
+    def _release_all(envs: list[Any]) -> None:
+        """Lift every held button.  Called on every exit path.
+
+        The unconditional release was the old contract precisely because a game
+        that never sees a keyup keeps the button down forever, turning one
+        mistake into a stuck character.  Holding makes that contract conditional,
+        so the release has to be guaranteed in a `finally` instead of assumed.
+        """
+        for env in envs:
+            release = getattr(env, "release", None)
+            if release is None:
+                continue
+            try:
+                release()
+            except Exception as exc:      # pragma: no cover - transport failure
+                log.warning("release failed on exit: %s", str(exc)[:120])
+
+    @staticmethod
+    def _state(result: Any) -> dict:
+        """Engine readout from Obs / StepResult, using `_frame`'s unwrapping.
+
+        `step()` returns a StepResult whose observation - and therefore whose
+        state - sits under `.obs`; reading `.state` off the StepResult gave an
+        empty dict on every step after the first, which the effect report would
+        have counted as "unreadable" rather than as a bug.
+        """
+        obs = getattr(result, "obs", result)
+        state = getattr(obs, "state", None)
+        return dict(state) if isinstance(state, dict) else {}
 
     def _prep(self, obs: np.ndarray) -> np.ndarray:
         """(H, W, C) uint8 -> model input size, RGB, float [0,1]."""
@@ -252,7 +344,9 @@ class InferenceRunner:
 
     # ------------------------------------------------------------------
 
-    def random_rollout(self, env: Any, steps: int, seed: int = 0) -> dict:
+    def random_rollout(self, env: Any, steps: int, seed: int = 0,
+                       motifs: list[list[int]] | None = None,
+                       motif_probability: float = 0.5) -> dict:
         """Uniformly random actions, run purely to widen the IDM's coverage.
 
         The paper updates the IDM on the agents' trajectories *supplemented with
@@ -261,6 +355,14 @@ class InferenceRunner:
         label corpus frames whose dynamics it has never observed - which shows
         up as the IDM answering every corpus pair with one constant class.
 
+        `motifs` widen coverage where uniform sampling cannot reach.  Measured:
+        the double jump needs jump, noop, jump - a release at the apex and a
+        second press - which uniform sampling hits once in 400 actions, so a
+        3000-step round contains about seven of them and the IDM never learns
+        the motion from data it never saw.  A motif is a short action sequence,
+        still chosen by the agent, so no human input is involved; it is a
+        coverage device in the same spirit as the paper's random-policy samples
+        and not a scripted policy.
         `seed` is the round's own: a fixed one made every round replay the SAME
         action sequence, so the "supplement" re-explored the same hundred steps
         forever instead of widening coverage.  Within a round it stays
@@ -276,12 +378,17 @@ class InferenceRunner:
         # walked out to map 5 during a random rollout - a measurement that hid
         # the very thing it was being read to decide.
         maps: list[int] = []
-        obs = self._frame(env.reset())
+        first = env.reset()
+        obs = self._frame(first)
         frames = [obs]
         acts: list[int] = []
+        states: list[dict] = [self._state(first)]
+        #: Actions queued by the current motif (see the docstring above).
+        pending: list[int] = []
         confirms = 0
         menu_escapes = 0
         difficulty_resolves = 0
+        gameover_resolves = 0
         for _ in range(max(0, int(steps))):
             kind, reason = self._scene_gate([env])
             if kind == "difficulty":
@@ -289,6 +396,14 @@ class InferenceRunner:
                         and self._resolve_difficulty([env])):
                     difficulty_resolves += 1
                     continue
+            if kind == "gameover":
+                if gameover_resolves < self.max_gameover_resolves:
+                    resolve = getattr(env, "resolve_gameover", None)
+                    if resolve is not None and resolve().get("resolved"):
+                        gameover_resolves += 1
+                        continue
+                log.error("aborting random-policy rollout: %s", reason)
+                break
                 log.error("aborting random-policy rollout: %s", reason)
                 break
             if kind == "menu":
@@ -310,16 +425,23 @@ class InferenceRunner:
                 log.error("aborting random-policy rollout: %s", reason)
                 break
             confirms = 0
-            idx = int(rng.integers(len(self.action_space)))
-            obs = self._frame(env.step(self.action_space.mask_at(idx), frames=self.frame_skip))
+            if not pending:
+                if motifs and float(rng.random()) < motif_probability:
+                    pending = list(motifs[int(rng.integers(len(motifs)))])
+                else:
+                    pending = [int(rng.integers(len(self.action_space)))]
+            idx = pending.pop(0)
+            stepped = self._step(env, self.action_space.mask_at(idx))
+            obs = self._frame(stepped)
             frames.append(obs)
             acts.append(idx)
+            states.append(self._state(stepped))
             if len(frames) % 10 == 0:
                 map_id = self._read_map(env)
                 if map_id is not None and (not maps or maps[-1] != map_id):
                     maps.append(map_id)
         return {"obs": np.asarray(frames), "act": np.asarray(acts, dtype=np.int64),
-                "maps": maps}
+                "state": states, "maps": maps}
 
     def run(
         self,
@@ -333,14 +455,17 @@ class InferenceRunner:
         states = [AgentState(agent_id=i) for i in range(len(envs))]
         # Prime every agent with its first observation.
         for s, env in zip(states, envs):
-            s.obs = self._frame(env.reset())
+            first = env.reset()
+            s.obs = self._frame(first)
             s.trajectory.append(s.obs)
+            s.states.append(self._state(first))
         started = time.time()
         stuck_seen = False
         abort_reason: str | None = None
         confirms = 0
         menu_escapes = 0
         difficulty_resolves = 0
+        gameover_resolves = 0
         while not stuck_seen and time.time() - started < timeout_s:
             # Safety gate, before a single key is dispatched.  In RPG Maker the
             # ok/cancel keys ARE the policy's jump/attack keys, so acting on a
@@ -351,6 +476,15 @@ class InferenceRunner:
                 if (difficulty_resolves < self.max_difficulty_resolves
                         and self._resolve_difficulty(envs)):
                     difficulty_resolves += 1
+                    continue
+                abort_reason = reason
+                log.error("aborting inference round: %s", abort_reason)
+                break
+            if kind == "gameover":
+                # Loading the save is the one entry this layer may commit, and the
+                # backend verifies it left the screen before reporting success.
+                if gameover_resolves < self.max_gameover_resolves and self._resolve_gameover(envs):
+                    gameover_resolves += 1
                     continue
                 abort_reason = reason
                 log.error("aborting inference round: %s", abort_reason)
@@ -391,8 +525,10 @@ class InferenceRunner:
                 # frame_skip game frames per action: the agent's timestep must
                 # match the corpus sampling interval, or the IDM is trained on
                 # one time scale and applied at another.
-                s.obs = self._frame(env.step(mask, frames=self.frame_skip))
+                stepped = self._step(env, mask)
+                s.obs = self._frame(stepped)
                 s.trajectory.append(s.obs)
+                s.states.append(self._state(stepped))
                 # Record the class index, not the mask: the IDM is trained on
                 # these as labels and its head is a classifier over the action
                 # space.  The mask is what the env consumes, the index is what
@@ -455,6 +591,7 @@ class InferenceRunner:
                 {
                     "obs": np.asarray(s.trajectory),
                     "act": np.asarray(s.actions, dtype=np.int64),
+                    "state": list(s.states),
                 }
                 for s in states
             ],

@@ -119,7 +119,23 @@
      Scene_Map gameplay", which also stops the agent dead every time it picks
      something up.  Anything whose ok selects among entries stays forbidden no
      matter how harmless it looks. */
-  V.CONFIRM_SCENES = ["Scene_ItemObtain"];
+  /* Scenes whose OK press only closes something - no entry is ever selected.
+
+     Every member needs a proof from the game itself, not from how harmless the
+     screen looks.  Measured lesson: Scene_Transport was listed here on the
+     reasoning that it is "a transition, it needs one ok" - it is a teleport
+     MENU, ok picked a destination the agent never chose, and the character was
+     dropped onto a damage trap.  The criterion is "does ok commit a choice".
+
+     - Scene_ItemObtain: Sprite_ItemObtain.pressOk = this.popScene.bind(this).
+     - Scene_HardGuide:  Sprite_HardGuide.updateInput calls this.pressOk on
+       Input.isAnyTriggered(), and Scene_HardGuide.createGuide sets
+       pressOk = this.popScene.bind(this); terminate() clears the guide flag.
+       It is a one-shot hint popup pushed from Scene_Map gameplay, with no list
+       and no paging, so no press can select anything.  Aborting on it instead
+       ended whole collection rounds: measured, a 2000-step rollout stopped after
+       196 steps reporting "scene 'Scene_HardGuide' is not Scene_Map gameplay". */
+  V.CONFIRM_SCENES = ["Scene_ItemObtain", "Scene_HardGuide"];
 
   /* Scenes where CANCEL is a back-out and cannot commit anything.
 

@@ -46,7 +46,7 @@ ROCm 版实测为 `torch 2.15.0a0+rocm10.2.0a20260924`（HIP 7.17）。
 
 ```bash
 .venv/bin/python -m ash.cli.main doctor                 # 环境自检
-.venv/bin/python -m pytest tests -q                     # 21 项回归测试
+.venv/bin/python -m pytest tests -q                     # 248 项回归测试
 .venv/bin/python -m ash.cli.main run --backend fake --delta 30 --max-steps 200
 ```
 
@@ -59,7 +59,7 @@ ROCm 版实测为 `torch 2.15.0a0+rocm10.2.0a20260924`（HIP 7.17）。
    见 `docs/game-architecture.md`）。
 2. `ash doctor --backend cdp` 确认后端探活。
 3. `ash run --backend cdp --num-agents 1 --delta 600`。
-   卡住阈值 Δ=600 步约对应 30 秒游戏时间（20 fps）。
+   卡住阈值 Δ=600 步 = 600 × `control_interval_s`(0.25 s) ≈ **150 秒游戏时间**。
 4. 循环报告写在 `runs/ash/loop-report.json`，每轮自举的 checkpoint 在
    `runs/ash/bootstrap-NNN/`。
 
@@ -71,6 +71,12 @@ ROCm 版实测为 `torch 2.15.0a0+rocm10.2.0a20260924`（HIP 7.17）。
 > 自进化循环的**管道全部打通并逐项真机验证过**（护栏、K、检索、裁剪、报告、录制）；
 > 但**唯一的学习信号来源——IDM 对语料帧的伪标签——实测不可用**（跨场景准确率 45.5%，
 > 多数类基线 50.4%，即等于瞎猜），所以 π 学不到「好行为」，表现为「尽量不动」。
+
+**能力边界（2026-09-26 决定）：** 接受这条边界，停止学习信号方向的实验。
+本项目**已交付、可复用的是「输入护栏 + 关键时刻记忆 K + 检索」这套框架**；
+**「自我精进」那一段没有成立**——不要当作已实现，也不适合作为「ASH 复现成功」引用
+（适合作为「ASH 的骨架 + 一个被测量过的失败点」引用）。决策记录与两条交接路径见
+[`docs/status.md`](docs/status.md) 第五节。
 
 ## 项目布局
 
@@ -146,7 +152,7 @@ AGENTS.md     项目工作文档入口
    语料里**没有任何一帧**与实机帧相似度超过 0.95。录一段你实际待的房间，K 才能在那里响；
    K 一响，卡死计时器不再累积，回合长度会从 `delta + random_steps` 变成几千步。
    录制文件按 `frames` 或 `observations` 任一字段时间读入，两种写法都接受。
-4. 每轮 `runs/ash/bootstrap-NNN/` 下的 `policy.pt` 即当前策略，
+7. 每轮 `runs/ash/bootstrap-NNN/` 下的 `policy.pt` 即当前策略，
    随时可用 `ash eval runs/ash/loop-report.json` 查看进度。
 
 **注意退出状态**：实机跑完游戏会被**刻意留在暂停态**（ticker 停住），目的是不让角色
@@ -155,117 +161,22 @@ AGENTS.md     项目工作文档入口
 
 ## 状态
 
-- [x] 核心模块与回归测试（110 passed）
-- [x] 实机输入安全护栏（场景探针 + 后端硬闸 + runner 中止 + **确认场景白名单**，
-      `tests/test_safety.py`）；真机只读验证通过：游戏内 `__ash.safety()` →
-      `{"scene":"Scene_Map","inGameplay":true}`，过场 → `{"scene":"Scene_Transport","confirm":true}`
-- [x] 退出保持暂停是刻意的（防无人操作时被打死），且退出时明确告知留在暂停态与恢复方法
-- [x] 语料 3 个视频，按 0.25 s 控制间隔重抽（9405 + 10406 + 13346 帧 @256×256，
-      共 33157 帧，基本全不重复）
-- [x] 时间尺度统一到 `control_interval_s`（0.25 s）：agent 15 帧/动作、语料 4 fps，
-      CLI 在不一致时拒绝启动（`tests/test_time_scale.py`）
-- [x] 随机策略采样补充 IDM（论文 Alg 4 步骤 2，原文档承诺但未实现）
-- [x] fake 后端端到端自举循环（`ash run --backend fake`，3 轮：检索命中 3 个语料
-      视频、K 拟合出 1 个保留簇、IDM 与 π 均收敛、checkpoint 落盘）
-- [x] CDP 后端联调（真机 PASS：注入、帧泵、快照/回滚往返、方法存活）
-- [x] 语料构建（`scripts/build_corpus.py`，ffmpeg 抽帧，实测 1176 帧全不重复）
-- [x] 检索实机验证（`scripts/verify_retrieval.py`，真机帧 vs 噪声对照 PASS）
-- [x] **完整自举循环实机跑通**（一次性 smoke：`--delta 60 --max-bootstraps 1
-      --image-size 64 --corpus data/corpus-live`，47 秒一轮）——推理 40 步判 stuck、
-      检测到 1 个关键时刻、检索命中 3/3、K 保留 2 个簇、IDM 与 π 训练完成、
-      `policy.pt`/`idm.pt` 落盘；安全护栏全程未误拦（`aborted: None`）
-- [ ] **IDM 还没学会依赖输入（当前主要障碍）**。实测：IDM 逐帧 logits 的方差只有
-      0.008，而类间偏置的平方是 0.13 —— **argmax 完全由偏置决定、与画面无关**；
-      随机初始化的 IDM 在语料上就已经 97% 输出同一个类。因此伪标签是常数，π 只能
-      学成「永远输出同一个动作」（`policy_val ~1e-6` 看起来像收敛）。
-      每轮 140 个转移（40 agent + 100 随机）对 16 类分类问题远远不够 —— 梯度下降最快
-      的降损方式就是把类别偏置拟合好然后停住。需要的是数据规模（更长 episode、
-      更多随机步、更多轮）或 IDM 预训练，不是接线。
-- [x] 已加护栏：伪标签退化（某一类 >90%）时**拒绝更新 π** 并报错，而不是静默地把它
-      训成常量。已在两个真实退化 checkpoint 上验证会触发
-      （`tests/test_pseudo_labels.py`）
-- [x] **实机驱动改为实时模式**：帧泵会改变游戏行为（同陷阱 A/B 实测：真实 ticker 会传送、
-      帧泵 1200 帧钉在受伤态不传送），自博弈改用 `drive="realtime"`
-- [ ] **实机操作已暂停（决定，2026-09-24）**：在「agent 的输入确实能驱动角色、
-      且伤害/死亡/菜单等场景都有可靠处置」被证据验证之前，不再对游戏发任何输入。
-      停止前的事故见 `docs/pitfalls.md` 第 14 条。
-- [x] **实机驱动验证通过**（2026-09-24，用正确信号 `screenX()/screenY()` 观测）：
-      `drive="realtime"` 下一轮 40 步，角色精灵累计移动 **3832 px**、位置变化 56 次，
-      全程 `canMove=True` —— agent 的动作**确实在驱动角色**
-      （此前用 `$gamePlayer.x/y` 观测得出「角色不动」的结论是**观测方法错误**：
-      本游戏是动作平台游戏，位置记在**精灵**上，格子坐标 `x/y` 永不更新）
-- [x] 语料嵌入缓存**真正被复用** + 加指纹失效（此前缓存路径默认 None，每次启动都重嵌整份语料）
-- [x] **K 恒 0 的根因（已纠正过一次）**：当时跑的是 1800 帧的 smoke 子集 + 384 维聚类。
-      实测三方对照（PCA-64）：
-      | 语料 | `clusters_kept` |
-      | --- | --- |
-      | 3 视频 / 33157 帧 | **7** |
-      | 6 视频 / 68440 帧 | **91** |
-      | 6 视频 / `c_min=2` | 189 |
-      **扩语料是主导因素（7→91）**；PCA 的作用是让拟合跑得完（384 维 6 分钟未完成 vs
-      PCA-64 113 秒）。**注意**：3 视频并非「数学上不可能」满足 `c_min=3`（keep 了 7 个），
-      只是非常苛刻——我先前写下的「不可能」是错的。
-- [x] **语料扩充**：新增 3 个 B 站结局 3 速通录像，现为 **6 视频 / 68440 帧**（4 fps、256×256）
-- [x] **K 不再为空**：6 视频语料 + PCA-64 拟合出 **91 个关键簇**（控制对照 3 视频仅 7 个）
-- [x] **K 的拟合结果缓存**（`data/corpus-kdm.pkl`，`--kdm-cache` 可覆盖；已被 `.gitignore` 的
-      `data/` 挡住，属可再生的派生产物）。实测全量 6 视频语料：
-      **首次拟合 116.5 s → 命中缓存 0.0 s，随机 400 帧的簇标签 400/400 完全一致**。
-      缓存带指纹（语料文件名+大小、嵌入分辨率、超参、hdbscan/scikit-learn 版本），
-      指纹不符/文件损坏/版本不符一律当作「没有缓存」并重建——缓存只许是加速手段。
-      另外：`embedder` **不进缓存**（它是调用方挂上去的，pickle torch 模块会让文件变大
-      且把有效性绑死在 torch 版本上），加载后由调用方重新挂。
-- [x] **修掉 `f0c5ad0` 引入的一处破坏性缺陷**：`bootstrap` 的关键时刻检测直接调用
-      `approximate_predict(kdm._clusterer, 原始向量)`，而 clusterer 已改成活在 PCA 空间里，
-      于是每个 bootstrap 轮都会抛 `ValueError: New points dimension does not match fit data!`
-      ——即「跑完一轮推理、进 bootstrap 就崩」。现统一走 `kdm.cluster_of()`（内含同一投影），
-      `tests/test_loop.py` 钉死。
-- [ ] 用扩充后的语料跑实机：验证 `key_moments` 能否被真正触发（这一条还没验证）
-- [x] **修掉「游戏永久冻结、且所有恢复路径都在撒谎」的缺陷**：帧泵把 `start()` 影子写在
-      **ticker 实例**上，而重新注入 `agent.js` 会替换 `window.__ash`（并丢掉 `V`）——
-      新 agent 手里没有 ticker 句柄，`unguard()` 静默无效，`resume()` 却返回
-      `{resumed:true}`。实测复现：pump 安装 → 重新注入 → `resume()` 报成功，而
-      `ticker.started` 仍为 `false`、`__ashGuarded` 仍为 `true`，游戏就此停死；
-      `close(resume=True)` / `resume_game()` 同样谎报成功。修法：影子里的判断读**活的**
-      `window.__ash`、`unguard(ticker)` 接受显式 ticker、`resume()` 用 `t.started`
-      **核实**后才报成功。`tests/test_pump_guard.py` 钉死（三条里有一条在旧代码上必红）。
-- [x] **全语料自举过去根本跑不起来（已修）**：`build_policy_dataset` 把训练窗口物化成
-      `(n_win, w_s, H, W, 3)` float32 —— 一个 **9405 帧**的语料视频就是 **59 GB** 的
-      `win_frames` + 14.7 GB 的 `win_mem`，而本机 16 GB。实测：全语料实机 run 的 bootstrap
-      **18 分钟单核 100%、零产物**（此前一直被 600 帧的 `corpus-live` 子集掩盖）。
-      改为 `WindowDataset`：只存一份 uint8 帧缓冲 + 每窗口索引，`batch(idx)` 现切。
-      同一视频实测 **峰值 RSS 3.54 GB**（原需 73.7 GB 才会开始）。`ds["frames"]` /
-      `ds["memories"]` 现在**显式抛 KeyError**——旧的静默分配才是真问题。
-      `tests/test_lazy_windows.py` 钉死 batch 与 `np.stack` 的窗口**逐位相同**。
-- [x] **K 批量查询**：`kdm.classify_sequence()` 一次 `approximate_predict` 覆盖整条轨迹，
-      bootstrap 用它、runner 仍用单帧 `classify()`，`tests/test_kdm.py` 直接比对两条路径
-      必须完全一致。**但只快 1.3×**（`approximate_predict` 本质是逐点 KD-tree 查询），
-      实测干净负载 1.2 ms/帧 —— 早先报的 3.4 ms/帧是**在实机 run 抢 CPU 时测的**，已更正。
-- [x] **每轮增量落盘**：报告原先只在 `run()` 返回后写一次，于是死在 bootstrap 里的 run
-      把整轮推理数据全部抹掉。现在每轮在 **bootstrap 开始前**就写一次（未完成时带
-      `bootstrap_pending: true`），原子替换。`tests/test_report_incremental.py` 钉死。
-- [x] **菜单逃生（cancel-only）**：agent 会自己按进菜单（实测 `Scene_SkillSt`，一轮只跑了
-      39 步就中止），而它永远出不来 → 整轮报废 + 需要人救。现在 `V.MENU_SCENES` +
-      `escape_menu()` 只派发 cancel、只限清单场景、次数有上限，失败即中止该轮。
-      **`MENU_SCENES` 与 `CONFIRM_SCENES` 是两份清单、不得有交集**（判据分别是
-      「cancel 安不安全」与「ok 安不安全」）。实测 `Scene_SkillSt` 两次 cancel 回到 `Scene_Map`。
-      另：中止还会连带丢掉该轮的随机探索（`random_transitions: 0`，因为中止后不再乱按）。
-- [x] **动作空间加入战斗/物品四个动词**（16 → 20，**只追加**，原下标不变）：
-      `special`(V 技能，耗 SP)、`ult`(A 武器大招，需黄条)、`weapon_switch`(S 换咸鱼武器)、
-      `item`(F 就地用物品，唯一能即时回血的动作)。`docs/game-systems.md` 早已把 S/A 记为
-      「不在动作空间里，可能是战斗能力受限的原因」；`F` 当年与 M/D 一起被有意排除，现按
-      要求加入（D 仍排除——速通用它等于作弊）。
-      **已验证「键到位」**（keydown 计数 + 引擎 `Input.keyMapper`：70→item / 83→cfish /
-      86→subattack / 65→zxc）；**未验证「效果」**（当前 0 物品、不在战斗、
-      `_equips` 为空即咸鱼武器非 MZ 标准装备系统）——效果需在战斗中另测。
-- [x] **属性强化其实可逆**：商店的**猫退烧药**会「退回强化材料并重置强化」（洗点），
-      所以此前「强化不可逆」的顾虑作废（但买药花钱本身仍不可逆）。
-- [x] **帧泵时钟锚定（修掉一个真缺陷）**：泵原先合成时钟从 **0** 起算，而 ticker 的
-      `lastTime` 是真实页面运行时间（实测 ~40000ms）。PIXI `Ticker.update()` 只在前进时才
-      跑一帧，否则把 delta 全置 0 **且不通知 listener** → **第一泵帧被整个吞掉**，随后
-      `lastTime = currentTime` 把时间轴重设到合成时钟上，卸载后引擎看到 ~40 秒跳变。
-      现在 `anchorClock()` 在 `install()`/`resume()` 时把 `origin` 与 `ticker.lastTime`
-      锚到真实时钟，喂 `origin + ticks*dt`：**dt 仍是固定 1/60 s**（确定性不丢），时间轴
-      始终在真实时间轴内。实测首帧 `deltaMS=16.667`（旧为 0）、卸载后无跳变。
-      **待验证**：这是否就是「后摇不结束 / 陷阱不传送」的病根——需在陷阱现场另测。
-- [ ] IDM 伪标签仍退化（每轮仅 60 条转移）：需大幅提高 `--random-steps` 或更多轮次
-- [ ] 实机长跑（`--max-bootstraps > 1`）：等 K / IDM 有信号后再谈
+> 数字与证据的**唯一出处**是 [`docs/status.md`](docs/status.md)；这里只留终态判断。
+> 曾经的逐条进度清单已删除——它与 `docs/status.md` 互相矛盾过（同一个 IDM 问题在两处
+> 结论相反），两份状态文档的维护成本比它记录的信息更贵。
+
+**已完成、真机验证过**：三层输入护栏（场景探针 / 后端硬闸 / runner 中止）；游戏异常
+场景的自动处置（难度对话 / ESC 菜单最后一栏 / GAME OVER 只许读档 / 道具弹窗 / 菜单
+cancel 逃生）；K（HDBSCAN + PCA-64 + 多轨迹过滤 + 缓存）；贪心一对一检索；语料裁剪；
+边录边落盘的录制器；每轮在 bootstrap 前落盘的可观测报告；248 项回归测试。
+
+**未完成、且经实测判定当前路线走不通**：π 的学习信号。IDM 对语料帧的伪标签退化为
+「先验 ≈ 一半 noop」，π 用 BC 模仿它就学成尽量不动。根因是**跨场景不泛化**
+（留出场景 45.5% vs 多数类基线 50.4%），三种架构都如此，第三种把训练集背到
+loss 0.0000 而留出仍是 49.6% ⇒ **瓶颈是带标签数据太少太窄，不是架构**。
+按 2026-09-26 的决策**停止在这条路上继续投入**；两条候选接手路径见
+`docs/status.md` 第五节。
+
+**因此当前可用的命令**：`ash doctor` / `ash record` / `ash assemble` / `ash pretrain-idm`
+/ `ash run --backend fake`（玩具环境端到端跑通）。`ash run --backend cdp` 能跑、护栏
+有效、报告完整，但**不要期待它变强**——它在语料覆盖不到的地方仍会退化成静止。

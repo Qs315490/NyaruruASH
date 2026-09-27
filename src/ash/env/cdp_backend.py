@@ -204,6 +204,10 @@ class CdpSpeedrunEnv:
         """
         try:
             if self.conn is not None:
+                # Lift any held button first.  Leaving the game paused with a
+                # movement key still down would let the character walk off a
+                # ledge the moment a human resumes the ticker.
+                self.release()
                 self.stop_screencast()
                 if self._pump_installed:
                     try:
@@ -369,7 +373,8 @@ class CdpSpeedrunEnv:
             if self.config.keymap.get(b) and self.config.keymap[b].names
         ]
 
-    def _check_safe(self, *, escape: bool = False, difficulty: bool = False) -> None:
+    def _check_safe(self, *, escape: bool = False, difficulty: bool = False,
+                    gameover: bool = False) -> None:
         """Refuse to touch the keyboard outside Scene_Map gameplay.
 
         The runner asks unsafe_reason() before it acts, but this is the
@@ -392,10 +397,33 @@ class CdpSpeedrunEnv:
             reason = self.menu_escape_reason()
         elif difficulty:
             reason = self.difficulty_reason()
+        elif gameover:
+            reason = self.gameover_reason()
         else:
             reason = self.unsafe_reason()
         if reason:
             raise UnsafeSceneError("refusing to dispatch input: %s" % reason)
+
+    def gameover_reason(self) -> str | None:
+        """Verdict for the narrow GAME OVER mode: only a save load may be pressed.
+
+        Anything other than "on GAME OVER with the save-load entry highlighted" is
+        refused, so this mode can never become a way to press ok on an
+        unrecognised screen.
+        """
+        try:
+            info = self.safety() or {}
+        except CdpError as exc:
+            return "safety probe failed (%s)" % (str(exc)[:120],)
+        if info.get("scene") != "Scene_Gameover":
+            return "not on the game over screen (%s)" % info.get("scene")
+        for entry in info.get("menuEntries") or []:
+            if entry.get("panel") != "_selectBox":
+                continue
+            if entry.get("name") in (self.GAMEOVER_SAFE_ENTRY, self.GAMEOVER_UNSAFE_ENTRY):
+                return None
+            return "unrecognised entry %r" % (entry.get("name"),)
+        return "the highlighted entry could not be read"
 
     def menu_escape_reason(self) -> str | None:
         """None when a bounded cancel-only menu escape may be attempted.
@@ -478,6 +506,109 @@ class CdpSpeedrunEnv:
         except CdpError:
             return False
         return bool(info.get("awaitingChoice") and info.get("guardedChoice"))
+
+    #: The one entry on the GAME OVER screen that may be committed.  The game's
+    #: own symbols say which is which, and the guardrail refuses the other; an
+    #: automatic routine that used to live here selected the refused one and had
+    #: no callers, so it both contradicted the policy and never ran.
+    GAMEOVER_SAFE_ENTRY = "STATIC_TEXT_CONTINUE_YES"
+    GAMEOVER_UNSAFE_ENTRY = "STATIC_TEXT_CONTINUE_NO"
+
+    def gameover_recovery_pending(self) -> bool:
+        """True on GAME OVER with the cursor somewhere other than the save load.
+
+        The screen is a two-button box and only the save-load entry may be
+        committed.  When the cursor sits on the other one the gate refuses input
+        and, before this existed, the whole round was thrown away - measured, a
+        2500-step collection died after 1314 steps on exactly that.
+        """
+        try:
+            info = self.safety() or {}
+        except CdpError:
+            return False
+        if info.get("scene") != "Scene_Gameover":
+            return False
+        for entry in info.get("menuEntries") or []:
+            if entry.get("panel") != "_selectBox":
+                continue
+            name = entry.get("name")
+            if name == self.GAMEOVER_SAFE_ENTRY:
+                return False                 # already safe: the gate allows it
+            if name == self.GAMEOVER_UNSAFE_ENTRY:
+                return True
+        return False
+
+    def resolve_gameover(self, *, max_presses: int = 6) -> dict[str, Any]:
+        """Move the GAME OVER cursor onto the save load and commit it.
+
+        Returns {"resolved", "presses", "reason"}.  Same contract as
+        `resolve_difficulty`: it answers nothing, it only *navigates to* the one
+        entry the policy already allows, the presses are bounded, and success is
+        verified by re-reading the scene instead of assumed - "I pressed up then
+        ok" is not evidence that the game left the screen.
+
+        The presses go through `_dispatch`, not `step_frame`: `step_frame` runs
+        the ordinary gate, which refuses this screen by design, and refusing to
+        move off the entry the policy rejects would leave the round dead-ended.
+        The narrow `gameover` verdict is checked before each press instead.
+        """
+        out: dict[str, Any] = {"resolved": False, "presses": 0, "reason": None}
+        try:
+            info = self.safety() or {}
+            up = mask_from_buttons(["up"])
+            ok = self._confirm_mask()
+        except CdpError as exc:
+            out["reason"] = str(exc)[:160]
+            return out
+        if info.get("scene") != "Scene_Gameover":
+            # Checked before the entries so the reason names the real problem: a
+            # Scene_Map payload has no select box at all, and reporting "the
+            # highlighted entry could not be read" sends the reader hunting for a
+            # cursor that was never there.
+            out["reason"] = "not on the game over screen (%s)" % info.get("scene")
+            return out
+        selected = None
+        for entry in info.get("menuEntries") or []:
+            if entry.get("panel") == "_selectBox":
+                selected = entry.get("name")
+        if selected == self.GAMEOVER_SAFE_ENTRY:
+            out["reason"] = "the save-load entry is already highlighted"
+            return out
+        if selected != self.GAMEOVER_UNSAFE_ENTRY:
+            # Unreadable is not "probably fine": this mode exists to move onto a
+            # known entry, so not knowing which one is highlighted is a refusal.
+            out["reason"] = "the highlighted entry could not be read"
+            return out
+        reason = self.gameover_reason() if self.enforce_safety else None
+        if reason:
+            out["reason"] = reason
+            return out
+        try:
+            self._dispatch(up)
+            self._between_presses()
+            out["presses"] += 1
+            moved = self._poll_safety(
+                lambda i: any(e.get("name") == self.GAMEOVER_SAFE_ENTRY
+                              for e in (i.get("menuEntries") or [])))
+            if not any(e.get("name") == self.GAMEOVER_SAFE_ENTRY
+                       for e in (moved.get("menuEntries") or [])):
+                out["reason"] = "the cursor did not move onto the save-load entry"
+                return out
+            self._dispatch(ok)
+            self._between_presses()
+            for _ in range(max(0, int(max_presses) - 1)):
+                out["presses"] += 1
+                after = self._poll_safety(lambda i: i.get("scene") != "Scene_Gameover")
+                if after.get("scene") != "Scene_Gameover":
+                    out["resolved"] = True
+                    out["scene"] = after.get("scene")
+                    return out
+                self._dispatch(ok)
+                self._between_presses()
+            out["reason"] = "still on the game over screen after %d presses" % out["presses"]
+        except (CdpError, UnsafeSceneError) as exc:
+            out["reason"] = "refused: %s" % (str(exc)[:120],)
+        return out
 
     def _difficulty_objection(self, info: dict | None) -> str | None:
         """The shared verdict for one safety read; None when a resolve may run."""
@@ -647,6 +778,67 @@ class CdpSpeedrunEnv:
         for binding in bindings:
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
 
+    # ------------------------------------------------------- held input mode
+    #
+    # Jump height in this game is controlled by how long the button stays down,
+    # measured with the engine's own py: a single 250 ms hold (one control
+    # interval) reaches 172 px where the game allows 212 px, and the second jump
+    # needs a release at the apex before the next press.  A step that always
+    # releases therefore cannot express either, whatever the policy wants.
+    #
+    # So the buttons may stay down ACROSS steps: choosing the same action again
+    # extends the hold, and switching action releases it.  "jump, jump" is then a
+    # longer jump and "jump, noop, jump" is exactly the game's double jump - both
+    # expressible by the policy instead of hard-coded here.
+    #
+    # `release()` is deliberately not safety gated even though `press()` is:
+    # letting go is the safe direction, and refusing to let go inside a menu
+    # would leave a button stuck down forever.
+
+    def press(self, mask: int) -> list[Any]:
+        """Put an action mask's buttons down and leave them down.  See `release()`.
+
+        Takes a MASK, like `step()` and `apply_action()` do - the action space's
+        index is a different number, and passing one where the other belongs
+        dispatches the wrong keys (index 3 is mask 3, which is up+down).
+        """
+        self._check_safe()
+        if self._held_action == int(mask):
+            return self._held_bindings
+        self.release()
+        bindings = self._bindings_for(mask)
+        for binding in bindings:
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
+        self._held_action = int(mask)
+        self._held_bindings = bindings
+        return bindings
+
+    def release(self) -> None:
+        """Lift whatever `press()` put down.  Idempotent, and never refused."""
+        for binding in getattr(self, "_held_bindings", []):
+            try:
+                self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+            except CdpError as exc:      # pragma: no cover - transport failure
+                log.warning("keyUp failed while releasing: %s", str(exc)[:120])
+        self._held_action = None
+        self._held_bindings = []
+
+    @property
+    def held_action(self) -> int | None:
+        return self._held_action
+
+    def advance(self, frames: int = 1) -> int:
+        """Let game time pass with the held buttons still down."""
+        return self.step_frame(self.action_space.noop, frames=frames, hold=True)
+
+    def step_holding(self, mask: int, frames: int = 1, *,
+                     screenshot: bool = True) -> StepResult:
+        """One step that does NOT release: the held variant of `step()`.  Mask in."""
+        self.press(mask)
+        self.advance(frames)
+        obs = self.observe(screenshot=screenshot)
+        return StepResult(obs=obs, reward=0.0, done=False, info={})
+
     def apply_action(self, action: int, *, settle_ms: float | None = None) -> None:
         """Press the buttons of an action mask, then release them.
 
@@ -684,6 +876,11 @@ class CdpSpeedrunEnv:
         if self.conn is None:
             raise CdpError("not connected")
         self._check_safe()
+        if not hold:
+            # A dispatch that is not a hold ends any hold: this is what keeps
+            # `press_ok`, `escape_menu`, `apply_action` and the old one-step API
+            # from leaving a movement key down while they press something else.
+            self.release()
         count = max(1, int(frames))
         if self.drive == "realtime":
             # The engine advances its own frames; hold the buttons for the
@@ -847,42 +1044,6 @@ class CdpSpeedrunEnv:
 
     # -------------------------------------------------------------------- obs
     # ----------------------------------------------------------------- guard
-    #: Scenes that mean a run is at risk.  Scene_Menu holds "back to town"
-    #: (useful) next to "return to title / load game / exit game" (fatal),
-    #: so a single stray keypress can end a run.  Scene_Gameover and the
-    #: title are equally unwanted mid-run.
-    DANGER_SCENES: tuple[str, ...] = (
-        "Scene_Menu",
-        "Scene_Gameover",
-        "Scene_Title",
-        "Scene_Load",
-        "Scene_Save",
-        "Scene_Options",
-        "Scene_Shop",      # walking into a merchant stalls the run
-        "Scene_Item",
-        "Scene_Skill",
-        "Scene_Status",
-        "Scene_Equip",
-        "Scene_SkillSt",   # NYA skill status screen (observed in a run)
-        "Scene_Formation",
-        "Scene_Debug",
-        "Scene_Transport",  # teleport menu: harmless but stalls a walk
-    )
-    #: Scenes exited with Escape/cancel; the rest (Gameover/Title) need OK.
-    ESCAPE_SCENES: tuple[str, ...] = (
-        "Scene_Menu",
-        "Scene_Shop",
-        "Scene_Item",
-        "Scene_Skill",
-        "Scene_SkillSt",
-        "Scene_Status",
-        "Scene_Equip",
-        "Scene_Formation",
-        "Scene_Load",
-        "Scene_Save",
-        "Scene_Options",
-        "Scene_Transport",
-    )
 
     #: Run-integrity invariants: switch id -> required value.  A speedrun
     #: assumes normal difficulty and no challenge-mode selection; a random
@@ -1131,143 +1292,6 @@ class CdpSpeedrunEnv:
             report["error"] = str(exc)[:120]
         return report
 
-    def guard_scene(self) -> dict[str, Any]:
-        """Detect and escape a run-threatening scene; returns a small report.
-
-        Escaping is done by injecting Escape (menu) / confirm (title) rather
-        than by touching game state, so the run stays honest: it is the same
-        recovery a human would perform, just faster.
-        """
-        if self.conn is None:
-            return {"scene": None, "escaped": False}
-        try:
-            scene = self.conn.evaluate(
-                "SceneManager._scene ? SceneManager._scene.constructor.name : null"
-            )
-        except CdpError:
-            return {"scene": None, "escaped": False}
-        report = {"scene": scene, "escaped": False}
-        if scene not in self.DANGER_SCENES:
-            return report
-        log.warning("danger scene %s detected; escaping", scene)
-        # Scene_Gameover is NOT a single-OK screen, which is what an earlier
-        # version of this guard assumed.  It is a two-button box
-        # (Scene_Gameover.prototype.createSelectBox):
-        #
-        #     _selected = "up"    -> pressLoad()   (load / autoload a save)
-        #     _selected = "down"  -> backToTown()  (respawn at town, full HP)
-        #
-        # and pressOk() *dispatches on the current selection* rather than
-        # moving it.  Mashing OK therefore never got past the screen: with no
-        # arrow press the selection stayed "up", pressLoad() saw the autosave
-        # (DataManager.isSaveFileExist(0)) and tried to load it, and the scene
-        # re-entered itself - the observed "Scene_Gameover" loop.
-        #
-        # The honest recovery is what the screen offers: pick "down" (back to
-        # town, which also refills HP) and confirm once.
-        if scene == "Scene_Gameover":
-            ok = self.config.keymap.get("jump")
-            if ok and ok.names:
-                try:
-                    # The select box only accepts input once the death
-                    # animation has played out and onAlphaEasingCompleted has
-                    # called _selectBox.active().  That takes a measured ~440
-                    # game frames, so the budget here must be generous: an
-                    # earlier 90-frame budget gave up long before the box was
-                    # ready and reported "not escaped" on a screen that was
-                    # simply still animating.
-                    #
-                    # Scene_Gameover.updateAnimationTimeline offers a skip:
-                    # pressing the "menu" key (Escape) during the animation
-                    # calls startFadeInBackSprite() immediately.  That is the
-                    # game's own affordance, so it is used first, then the wait
-                    # only has to cover the remaining fade.
-                    menu = self.config.keymap.get("menu")
-                    if menu and menu.names:
-                        self._tap_binding(menu)
-                    ready = False
-                    for _ in range(240):          # 240 x 5 = 1200 frames
-                        for _ in range(5):
-                            self.step_frame(self.action_space.noop)
-                        state = self.conn.evaluate(
-                            "(function(){try{var s=SceneManager._scene;"
-                            "if(!s||s.constructor.name!=='Scene_Gameover')"
-                            "  return {scene:s?s.constructor.name:null};"
-                            "var b=s._selectBox;"
-                            "return {scene:'Scene_Gameover',"
-                            "  box: b?!!b._active:false,"
-                            "  selected: b?b._selected:null};}catch(e){"
-                            "return {scene:null, err:String(e).slice(0,80)};}})()"
-                        )
-                        if not isinstance(state, dict):
-                            continue
-                        if state.get("scene") not in (None, "Scene_Gameover"):
-                            report["escaped"] = True
-                            report["scene"] = state["scene"]
-                            return report
-                        if state.get("box"):
-                            ready = True
-                            break
-                    if not ready:
-                        report["scene"] = "Scene_Gameover"
-                        report["reason"] = "select box never became active"
-                        return report
-                    # Move the selection to "down" if it is not there already.
-                    selected = self.conn.evaluate(
-                        "(function(){try{return SceneManager._scene._selectBox._selected;}"
-                        "catch(e){return null;}})()"
-                    )
-                    if selected != "down":
-                        self._tap_binding(self.config.keymap.get("down"))
-                    # Confirm, then give the scene switch time to happen.
-                    self._tap_binding(ok)
-                    for _ in range(120):
-                        for _ in range(5):
-                            self.step_frame(self.action_space.noop)
-                        now = self.conn.evaluate(
-                            "SceneManager._scene ? SceneManager._scene.constructor.name : null"
-                        )
-                        if now not in self.DANGER_SCENES:
-                            report["escaped"] = True
-                            report["scene"] = now
-                            break
-                    else:
-                        report["scene"] = now
-                except CdpError as exc:
-                    report["error"] = str(exc)[:120]
-            return report
-        # Different NYA scenes close on different keys: the menu on Escape,
-        # shops/items on the cancel key.  Try both rather than guessing.
-        candidates = []
-        for name in ("menu", "cancel"):
-            binding = self.config.keymap.get(name)
-            if binding and binding.names:
-                candidates.append(binding)
-        if scene in self.ESCAPE_SCENES and candidates:
-            try:
-                for _ in range(6):
-                    for binding in candidates:
-                        self.step_frame(self.action_space.noop)
-                        self.conn.call(
-                            "Input.dispatchKeyEvent",
-                            self._key_params(binding, "rawKeyDown"),
-                        )
-                        self.step_frame(self.action_space.noop)
-                        self.conn.call(
-                            "Input.dispatchKeyEvent",
-                            self._key_params(binding, "keyUp"),
-                        )
-                        self.step_frame(self.action_space.noop)
-                        now = self.conn.evaluate(
-                            "SceneManager._scene ? SceneManager._scene.constructor.name : null"
-                        )
-                        if now not in self.DANGER_SCENES:
-                            report["escaped"] = True
-                            report["scene"] = now
-                            return report
-            except CdpError as exc:
-                report["error"] = str(exc)[:120]
-        return report
 
     def observe(self, *, screenshot: bool = True) -> Obs:
         state = self.state()
@@ -1368,6 +1392,11 @@ class CdpSpeedrunEnv:
                 "%s: contains // which would comment out the rest of the JS"
                 % label
             )
+
+    #: Which action's buttons are down right now, and their bindings, so a later
+    #: `release()` knows exactly what to lift.
+    _held_action: int | None = None
+    _held_bindings: list = []
 
     _STATE_EXPR = (
         "JSON.stringify({player: window.__ash ? __ash.playerState() : null,"
