@@ -120,6 +120,13 @@ class CdpSpeedrunEnv:
         self._frame_count = 0
         self._screencast_on = False
         self._frame_times: list[float] = []
+        #: Opt-in per-step screencast logging (see `record_step_frames`).  The
+        #: stream is normally coalesced to its newest frame; the forward-window
+        #: work needs the frames INSIDE a 0.25 s hold, which is the 30 fps
+        #: resolution the video side has and this side otherwise throws away.
+        self._recording_steps = False
+        self._step_frames: list[list[tuple[float, np.ndarray]]] = []
+        self._current_step: list[tuple[float, np.ndarray]] | None = None
         self._pump_installed = False
         self._rng_enabled = False
         self._milestone_resolver: Callable[[dict[str, Any]], str | None] | None = None
@@ -364,14 +371,44 @@ class CdpSpeedrunEnv:
             params = event.get("params", {})
             data = params.get("data")
             if data:
-                self._frame = _decode_jpeg_base64(data, self.config.resize)
+                frame = _decode_jpeg_base64(data, self.config.resize)
+                self._frame = frame
                 self._frame_count += 1
                 got += 1
                 self._frame_times.append(time.monotonic())
                 if len(self._frame_times) > 128:
                     self._frame_times = self._frame_times[-128:]
+                self._record_step_frame(frame, params.get("metadata") or {})
             self._ack(params.get("sessionId"))
         return got
+
+    def _record_step_frame(self, frame: np.ndarray, metadata: dict[str, Any]) -> None:
+        """Append a frame to the current step's log, if one is being recorded."""
+        if self._current_step is None:
+            return
+        stamp = metadata.get("timestamp")
+        self._current_step.append(
+            (float(stamp) if isinstance(stamp, (int, float)) else time.monotonic(), frame))
+
+    def record_step_frames(self, on: bool = True) -> None:
+        """Start (or stop) keeping every screencast frame that arrives during a step.
+
+        Off by default and harmless when off: the stream keeps being coalesced
+        to its newest frame exactly as before.  On, each realtime hold is logged
+        as its own frame sequence - the 0.25 s the buttons were down, sampled at
+        whatever rate the compositor produces.  `take_step_frames()` returns and
+        clears the log; entries line up one per dispatched action, so gate
+        handling that skipped a step simply has no entry.
+        """
+        self._recording_steps = bool(on)
+        self._step_frames = []
+        if not on:
+            self._current_step = None
+
+    def take_step_frames(self) -> list[list[tuple[float, np.ndarray]]]:
+        """Return and clear the recorded per-step frame sequences."""
+        out, self._step_frames = self._step_frames, []
+        return out
 
     def capture_once(self, *, timeout: float = 2.0) -> np.ndarray:
         """Force a fresh screenshot through Page.captureScreenshot.
@@ -844,11 +881,36 @@ class CdpSpeedrunEnv:
             raise CdpError("not connected")
         self._check_safe()
         bindings = self._bindings_for(action)
+        duration = max(0.0, float(duration_s))
         for binding in bindings:
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
-        time.sleep(max(0.0, float(duration_s)))
+        if self._recording_steps:
+            # Keep receiving for the whole hold instead of sleeping through it:
+            # the screencast frames of the interval are the consequence of the
+            # press, and they are only in the socket while the button is down.
+            # Flush first: frames buffered during the previous step's observation
+            # belong to the gap, not to this hold.
+            self._current_step = None
+            self._drain_frames(timeout=0.0)
+            self._current_step = []
+            start = time.monotonic()
+            while True:
+                remaining = duration - (time.monotonic() - start)
+                if remaining <= 0:
+                    break
+                # Short drains on purpose: Chromium waits for the frame's ack
+                # before it encodes the next one, and a long drain delays that
+                # ack.  Measured on this game: ~12 fps with 50 ms drains, ~59 fps
+                # with 4 ms - the ack cadence, not the game (59 fps) or the JPEG
+                # size (unchanged from 128 to 448 px wide), is what limits it.
+                self._drain_frames(timeout=min(0.004, max(0.001, remaining)))
+        else:
+            time.sleep(duration)
         for binding in bindings:
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+        if self._current_step is not None:
+            self._step_frames.append(self._current_step)
+            self._current_step = None
 
     # ------------------------------------------------------- held input mode
     #

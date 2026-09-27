@@ -1,25 +1,26 @@
-"""Collect self-play data with the engine teacher attached.
+"""Self-play with the 30 fps frames INSIDE each 0.25 s hold.
 
-This is the allowed data source: the agent's own actions, labelled by the agent
-itself, with the game's own readout of the player alongside each step.  No human
-input is involved anywhere.
+The forward-window finding (action keys 0.126 -> 0.678 within a video, peak at 0.27 s) was
+measured on 30 fps video frames.  Self-play was collected one frame per control step - 4 fps - so
+it cannot represent a 0.27 s window at all, and the earlier "self-play + forward window" attempt
+was forced to use future TICKS (0.75 s) as a substitute.  It does not need to be:
 
-It exists to answer one question before anything is trained: how much of
-self-play data is INFORMATIVE?  On the human recordings the answer was 35%
-unidentifiable, and feeding only the informative pairs beat feeding everything
-(macro-recall 0.177 against a 0.135 chance level, versus 0.018 for a random
-subset of the same size).  Self-play may be a different number, and the filter
-should be chosen from it rather than assumed.
+    Page.startScreencast is already running on this connection.  The backend used to coalesce it
+    to its newest frame, but while the buttons are held the frames of that interval - the actual
+    consequence of the press - are exactly what the screenshot stream contains.
+
+So the backend gained an opt-in per-step log (`record_step_frames` / `take_step_frames`) and this
+collector uses it.  Everything else is the tested path: the same runner random rollout, the same
+scene guardrails, the same engine-state teacher, no human input anywhere.
 
 Writes `runs/selfplay/<name>.npz`:
-    frames   (T, 128, 128, 3) uint8     observations at the model size
-    acts     (T-1,)            int64    the action taken at t, as a class index
-    motion   (T-1,)            float32  mean |frame[t+1] - frame[t]| / 255
-    moved    (T-1,)            bool     the PLAYER's own body moved (the teacher)
-    known    (T-1,)            bool     the teacher could be read at all
-    states   (T,)              object   the raw per-step engine readout
+    frames        (T, S, S, 3) uint8     the per-step observation (tick boundaries, as before)
+    frames30      (T-1,) object          per step: (n_t, S, S, 3) uint8 frames during the hold
+    frames30_t    (T-1,) object          per step: the screencast timestamps of those frames
+    acts          (T-1,) int64           the action taken at t, as a class index
+    motion/moved/known/states            unchanged from `collect_selfplay`
 
-    uv run python scripts/collect_selfplay.py --steps 600 --name selfplay-001
+    uv run python scripts/collect_selfplay_30fps.py --steps 600 --motifs --hold-actions
 """
 
 from __future__ import annotations
@@ -44,15 +45,14 @@ from ash.loop.runner import InferenceRunner  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=600, help="随机步数（每步 %ds 游戏时间）")
-    ap.add_argument("--name", default="selfplay-001")
+    ap.add_argument("--steps", type=int, default=600)
+    ap.add_argument("--name", default="selfplay-30fps-001")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--image-size", type=int, default=128)
     ap.add_argument("--out", default="runs/selfplay")
     ap.add_argument("--hold-actions", action="store_true",
-                    help="按住跨步（跳跃高度与二段跳需要它）")
-    ap.add_argument("--motifs", action="store_true",
-                    help="用短动作序列探索：均匀随机撞不到二段跳（1/400）")
+                    help="按住跨步；30fps 窗正好覆盖一次按住（跳跃高度需要它）")
+    ap.add_argument("--motifs", action="store_true")
     args = ap.parse_args()
 
     env = CdpSpeedrunEnv(drive="realtime", resize=(args.image_size, args.image_size))
@@ -66,23 +66,17 @@ def main() -> int:
         print("拒绝采集：%s" % reason)
         return 3
     if not safety.get("tickerRunning"):
-        # A stopped ticker means the game does not advance while keys are held, so
-        # the run would collect a frozen character and call it data.
         print("拒绝采集：引擎 ticker 未运行（游戏处于暂停态），先在页面里 __ash.pump.resume()")
         return 3
     print("scene=%s map=%s hp=%s | 护栏允许" % (
         safety.get("scene"), (env.state().get("player") or {}).get("mapId"),
         env.state().get("hp")))
 
-    # The runner is used for its random rollout, which is the tested path through
-    # the scene guardrails; the policy and K play no part in it.
-    # A throwaway policy: the random rollout never consults it, but the runner's
-    # constructor insists on one.  Built tiny so this costs nothing.
     space = env.action_space
     game = load_game_config()
-    # Two collectors read this: making the step 1 game frame instead of the
-    # derived control interval is 15x faster to collect and 15x wrong - the IDM
-    # would be trained at 60 fps and applied to a 4 fps corpus.
+    # The agent's timestep, from the single source (game.yaml:control_interval_s).
+    # Leaving it at the constructor default of 1 means one game frame (16.7 ms)
+    # per action, which is 15x finer than the 4 fps corpus the IDM is applied to.
     frame_skip = game.control_frame_skip
     policy = AshPolicy(AshPolicyConfig(image_size=args.image_size, w_s=1, w_l=1,
                                        num_layers=1, num_actions=len(space)))
@@ -91,16 +85,9 @@ def main() -> int:
                              frame_skip=frame_skip, hold_actions=bool(args.hold_actions))
     print("control: %.3f s/step = %d game frames (corpus %.1f fps)"
           % (game.control_interval_s, frame_skip, game.corpus_fps))
-    # Coverage motifs.  Uniform sampling reaches jump,jump about once in twenty
-    # actions, but jump,noop,jump - the double jump - about once in four hundred,
-    # so a round would contain a handful.  These are action sequences, still
-    # executed by the agent's own input; the point is that the dynamics get seen.
     motifs: list[list[int]] = []
     if args.motifs:
         def idx(name: str) -> int:
-            # The noop mask has an EMPTY button set, so its name here is "" and
-            # not "noop": looking for the literal string raised StopIteration and
-            # killed the collection before a single step ran.
             want = "" if name == "noop" else name
             return next(i for i, m in enumerate(space.masks)
                         if ", ".join(buttons_from_mask(m)) == want)
@@ -117,9 +104,26 @@ def main() -> int:
         motifs = [[idx(n) for n in seq] for seq in named]
         print("motifs: %d 种，最长 %d 步" % (len(motifs), max(len(m) for m in motifs)))
 
+    env.record_step_frames(True)
     started = time.time()
     traj = runner.random_rollout(env, args.steps, args.seed, motifs=motifs or None)
-    print("采到 %d 步（%.1f s 墙钟）" % (len(traj["act"]), time.time() - started))
+    wall = time.time() - started
+    step_frames = env.take_step_frames()
+    env.record_step_frames(False)
+    print("采到 %d 步（%.1f s 墙钟）；记录到 %d 段按住帧" % (len(traj["act"]), wall, len(step_frames)))
+
+    counts = np.asarray([len(s) for s in step_frames], dtype=np.int32)
+    if len(step_frames):
+        print("每步帧数：中位 %d，最小 %d，最大 %d，合计 %d"
+              % (int(np.median(counts)), int(counts.min()), int(counts.max()), int(counts.sum())))
+        all_t = [t for s in step_frames for t, _ in s]
+        dt = np.diff(all_t)
+        if len(dt) and dt.size:
+            print("帧间隔中位 %.1f ms（≈%.1f fps）" % (1000 * float(np.median(dt)),
+                                                    1.0 / max(1e-6, float(np.median(dt)))))
+    if len(step_frames) != len(traj["act"]):
+        print("警告：帧段数 %d != 动作数 %d（护栏跳过的步不会产生帧段，需对齐）"
+              % (len(step_frames), len(traj["act"])))
 
     frames = np.asarray(traj["obs"], dtype=np.uint8)
     acts = np.asarray(traj["act"], dtype=np.int64)
@@ -132,11 +136,19 @@ def main() -> int:
     moved = np.asarray([p["moved"] for p in per_step], dtype=bool)
     known = np.asarray([p["known"] for p in per_step], dtype=bool)
 
+    f30 = np.empty(len(step_frames), dtype=object)
+    t30 = np.empty(len(step_frames), dtype=object)
+    for i, seq in enumerate(step_frames):
+        f30[i] = np.stack([f for _, f in seq]) if seq else np.zeros((0, args.image_size,
+                                                                    args.image_size, 3), np.uint8)
+        t30[i] = np.asarray([t for t, _ in seq], np.float64)
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     path = out / ("%s.npz" % args.name)
     np.savez_compressed(
         path, frames=frames, acts=acts, motion=motion, moved=moved, known=known,
+        frames30=f30, frames30_t=t30, frames30_n=counts,
         states=np.asarray([json.dumps(s, ensure_ascii=False) for s in states], dtype=object),
     )
 
@@ -145,15 +157,7 @@ def main() -> int:
                 "screen_changed", "screen_still", "nothing_changed", "noop_label"):
         print("  %-16s %6d" % (key, report[key]))
     print("  %-16s %s" % ("有信息比例", "%.1f%%" % (100 * (report["own_moved"] / max(1, report["transitions"])))))
-    print("  %-16s %.1f%%" % ("人动/画面也动", 100 * report["share_own_moved"]))
-    print("  %-16s %s" % ("完全无变化", "%.1f%%" % (100 * (report["share_nothing_changed"] or 0))))
     print("\n写入 %s（%.1f MB）" % (path, path.stat().st_size / 1e6))
-    # Leave the game PAUSED.  `close()` pauses by default, and resuming here
-    # was a real bug: the character was left standing in the world after
-    # every probe and collection, and the enemies killed it while nobody was
-    # driving (measured: hp 150 -> 0 and a GAME OVER screen left sitting).
-    # `ash record` resumes because the player is driving and wants the game
-    # back; an unattended agent run must not.
     env.close(resume=False)
     return 0
 
