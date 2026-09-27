@@ -60,7 +60,15 @@ def test_the_four_verbs_are_appended():
     space = ActionSpace.minimal()
     tail = [buttons_from_mask(space.mask_at(i))
             for i in range(len(ORIGINAL_MASKS), len(space))]
-    assert tail == [("special",), ("ult",), ("weapon_switch",), ("item",)]
+    # The four verbs, then the seven combinations the speedrun videos need
+    # (direction+dash, the dash-jump chains, the diagonals, direction+special).
+    # ESC/menu is not one of them: test_safety pins that invariant.
+    # Order matters: these are appended, so every index above keeps its meaning.
+    assert tail == [("special",), ("ult",), ("weapon_switch",), ("item",),
+                    ("left", "dash"), ("right", "jump", "dash"),
+                    ("left", "jump", "dash"), ("down", "right"),
+                    ("down", "special"), ("down", "left"),
+                    ("down", "right", "special")]
     for combo in NEW_VERBS:
         mask = mask_from_buttons(combo)
         assert mask in space, "%s is not in the action space" % (combo,)
@@ -69,7 +77,7 @@ def test_the_four_verbs_are_appended():
 
 def test_head_width_matches_the_space():
     """The one constant both model heads default to must equal the real space."""
-    assert len(ActionSpace.minimal()) == DEFAULT_NUM_ACTIONS == 20
+    assert len(ActionSpace.minimal()) == DEFAULT_NUM_ACTIONS == 27
 
 
 def test_the_new_keys_are_bound_in_the_keymap():

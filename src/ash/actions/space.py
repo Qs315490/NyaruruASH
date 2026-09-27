@@ -40,7 +40,18 @@ BUTTON_INDEX: dict[str, int] = {name: i for i, name in enumerate(BUTTONS)}
 # being repeated as a magic number in each model.  tests/test_action_space.py
 # asserts it still equals len(ActionSpace.minimal()), which is what keeps the
 # constant from drifting away from the space it describes.
-DEFAULT_NUM_ACTIONS = 20
+#: 20 hand-picked primitives plus 7 combinations that the speedrun videos use
+#: constantly and the original space could not express at all.  Measured on
+#: BV19s4y1y7un's own input display: 18.2% of 10293 control ticks were combinations
+#: with no mask, and mapping them to the nearest one silently threw away 34.5% of the
+#: dash ticks and over 77% of the up/down ticks - i.e. exactly the actions a speedrun
+#: is made of.  These eight were the most frequent of those, taking the unexpressible
+#: share to 7.5% (the long tail still falls back to the nearest expressible one).
+#: ESC/menu is deliberately NOT among them, although the speedruns press it (0.6% of
+#: ticks): tests/test_safety.py pins "the live action space never contains ESC", since
+#: a policy that can open the pause menu at will is a new capability with real risk,
+#: and those ticks simply become noop.
+DEFAULT_NUM_ACTIONS = 27
 
 
 def mask_from_buttons(buttons: Iterable[str]) -> int:
@@ -148,6 +159,18 @@ class ActionSpace:
             ("ult",),
             ("weapon_switch",),
             ("item",),
+            # Appended again (indices 20-27): the combinations the speedruns use and
+            # the space had no mask for.  In order of how often they occur in
+            # BV19s4y1y7un: direction+dash, the dash-jump chains, the diagonals, and
+            # direction+special.  The diagonals are why up/down were being discarded:
+            # with no diagonal mask, "down+right" can only become "down" or "right".
+            ("left", "dash"),
+            ("right", "jump", "dash"),
+            ("left", "jump", "dash"),
+            ("down", "right"),
+            ("down", "special"),
+            ("down", "left"),
+            ("down", "right", "special"),
         ]
         space = cls.from_button_names(combos)
         return cls(masks=space.masks, meta=dict.fromkeys(space.masks, "heuristic"))

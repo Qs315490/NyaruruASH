@@ -108,7 +108,8 @@ PAGE = """<!doctype html>
       <select id="speed"><option>0.25</option><option>0.5</option>
         <option selected>1</option><option>2</option><option>4</option></select>
       <label id="l-zoom"></label>
-      <select id="zoom"><option value="0.5">50%</option><option value="0.75">75%</option>
+      <select id="zoom"><option value="0.25">25%</option><option value="0.33">33%</option>
+        <option value="0.5">50%</option><option value="0.75">75%</option>
         <option value="1" selected>100%</option><option value="1.5">150%</option></select>
       <label id="l-lang"></label><select id="lang">
         <option value="zh">中文</option><option value="en">English</option></select>
@@ -120,18 +121,38 @@ PAGE = """<!doctype html>
   </div>
   <div class="col">
     <div id="l-panel"></div>
+    <div class="pos" id="panelinfo"></div>
+    <div class="pos" id="handle"></div>
     <canvas id="panel" width="600" height="276"></canvas>
     <div id="l-table"></div>
     <table id="map"></table>
     <div><button id="b-save"></button><button id="b-scan"></button>
-      <button id="b-scanstop"></button><button id="b-discover"></button></div>
+      <button id="b-discover"></button></div>
   </div>
 </div>
 <video id="v" src="/video.mp4" style="display:none" preload="auto"></video>
 <canvas id="probe" width="__PW__" height="__PH__" style="display:none"></canvas>
 <script>
+// Any error in this script leaves the page as an empty HTML skeleton with no clue why -
+// which is exactly how "the page only shows its frame" was reported.  Make the failure
+// speak instead: the message lands in the status line where the user is already looking.
+window.addEventListener('error', ev => {
+  const st = document.getElementById('status');
+  if(st) st.textContent = "JS error: " + (ev.message || (ev.error && ev.error.message) || ev);
+});
 let CELLS = __CELLS__;
-const PANEL = __PANEL__, PW = __PW__, PH = __PH__;
+let PANEL = __PANEL__, PW = __PW__, PH = __PH__;
+// Native frame size.  Everything - panel box, cell coordinates, hit testing, clamping -
+// lives in this space, because that is where the boxes and cells were measured.  The
+// first version hardcoded 1280x720: for a 1920x1080 video the panel (y=815) and its
+// keycaps (y~884) were simply outside the canvas, so the box could not be grabbed by its
+// bottom edge (it was off-screen) and every marker was drawn in the wrong place.  The
+// display size is CSS's job now, not the coordinate system's.
+let VW = 1280, VH = 720;
+// The panel box is per video and a screenshot estimate can be wrong by enough to
+// slice the row above into the crop (that is what broke one video's layout).  The
+// box is therefore adjustable by dragging a rectangle on the frame.
+let panelMode = false, panelRect = null;
 let NAMES = Object.keys(CELLS), NUM = {};
 NAMES.forEach((k,i)=>NUM[k]=i+1);
 const S = {
@@ -143,12 +164,17 @@ const S = {
      prevPress:"上一处按下",nextPress:"下一处按下",scan:"扫描全片",
      scanning:"扫描中 %d%%",scanDone:"扫描完成（每格按下次数已更新）",
      noNext:"%s 之后没有按下",noPrev:"%s 之前没有按下",jumpTo:"已跳到 %.2fs",
-     hint:"快捷键：空格 播放/暂停 · ←/→ ±5秒 · Shift+←/→ 单帧 · , . 单帧 · Home 回到开头",
+     hint:"快捷键：空格 播放/暂停 · ←/→ ±5秒 · Shift+←/→ 单帧 · , . 单帧 · Home 回到开头 · Shift+拖拽视频＝重画面板框",
      addCell:"新增细胞 %s（点击放大面板添加；拖动已有标记可改位置）",del:"删除",deleted:"已删除 %s",
      moved:"%s 已移到 %s",
      scanStop:"停止扫描",scanStopped:"扫描已停止（已扫到的区间保留）",
-     discover:"扫描缺失按键",discovering:"扫描中 %d%%（每秒取一帧）",
+     panelSet:"框选面板位置",panelHint:"在视频上拖一个矩形框住按键面板（Esc 取消）",
+     panelDone:"面板已设为 (%d,%d) 尺寸 %dx%d；细胞已随面板一起平移",
+     panelNow:"当前面板 (%d,%d) %dx%d",
+     dirMoved:"方向九宫格已整体移动（9 个球位一起）",
+     discover:"扫描缺失按键",discovering:"扫描中 %d%%（从当前帧起，每秒一帧）",
      discoverDone:"扫描完成：发现 %d 个候选位置，新增 %d 个细胞",
+     discoverStopped:"已停止：已扫到的部分已处理，新增 %d 个细胞",
      discoverNone:"没有发现缺失的键帽（已有细胞覆盖了所有亮过的位置）"},
  en:{h:"keycast labeler (browser)",start:"start",back:"-5s",prev:"prev frame",
      play:"play",pause:"pause",next:"next frame",fwd:"+5s",speed:"speed",lang:"lang",
@@ -157,12 +183,17 @@ const S = {
      save:"save mapping",saved:"saved",need:"n/a",presses:"%d presses",title:"keycast labeler",
      prevPress:"prev press",nextPress:"next press",scan:"scan whole video",
      scanning:"scanning %d%%",scanDone:"scan done (press counts updated)",
-     discover:"find missing keys",discovering:"scanning %d%% (one frame per second)",
+     panelSet:"set panel box",panelHint:"drag a rectangle over the keycast panel (Esc cancels)",
+     panelDone:"panel (%d,%d) %dx%d; cells shifted with it",
+     panelNow:"panel now (%d,%d) %dx%d",
+     dirMoved:"direction grid moved as a whole (all nine ball positions)",
+     discover:"find missing keys",discovering:"scanning %d%% from here (one frame per second)",
      discoverDone:"done: %d candidate positions, %d cells added",
+     discoverStopped:"stopped: what was scanned is kept, %d cells added",
      discoverNone:"no missing keycaps found (the existing cells cover everything lit)",
      noNext:"%s has no press after this",noPrev:"%s has no press before this",
      jumpTo:"jumped to %.2fs",
-     hint:"keys: space play/pause · ←/→ ±5s · shift+←/→ one frame · , . one frame · home start",
+     hint:"keys: space play/pause · ←/→ ±5s · shift+←/→ one frame · , . one frame · home start · shift+drag frame = redraw panel box",
      addCell:"added cell %s (click the panel to add; drag a marker to move it)",
      moved:"%s moved to %s",
      del:"delete",deleted:"deleted %s",scanStop:"stop scan",
@@ -192,7 +223,28 @@ function syncCells(){          // after adding/removing a keycap by hand
     if(open[k]===undefined) open[k]=null; });
 }
 function postCells(){
-  fetch('/api/cells',{method:'POST',body:JSON.stringify({cells:CELLS,panel:PANEL})});
+  fetch('/api/cells',{method:'POST',
+    body:JSON.stringify({cells:CELLS, panel:PANEL, panel_size:[PW,PH],
+                         dir_proto:DIRPROTO})});
+}
+function applyPanel(x, y, w, h){
+  // The box and the cells are ONE template: moving it carries the cells along, resizing
+  // it scales them.  The first version shifted the cells so that their ABSOLUTE frame
+  // positions were preserved - correct for "crop a panel whose keycaps I already know",
+  // wrong for "fit this layout onto the panel on screen", which is what the box is for:
+  // there the markers must stay on the same spot of the panel graphic.
+  const sx = w / PW, sy = h / PH;
+  for(const k in CELLS){ CELLS[k] = [Math.round(CELLS[k][0] * sx), Math.round(CELLS[k][1] * sy)]; }
+  // dir_proto lives in the same panel-relative space and must follow, or the direction
+  // decoder silently reads nine positions that no longer line up with the ball.
+  for(const k in DIRPROTO){ DIRPROTO[k] = [DIRPROTO[k][0] * sx, DIRPROTO[k][1] * sy]; }
+  PANEL = [x, y]; PW = w; PH = h;
+  pr.width = PW; pr.height = PH;
+  pc.width = PW * 2; pc.height = PH * 2;   // magnified view follows the box
+  _tag = new Uint8Array(PW * PH); _lab = new Int32Array(PW * PH);
+  postCells(); buildTable();
+  document.getElementById('status').textContent =
+    S[lang].panelDone.replace("%d", x).replace("%d", y).replace("%d", w).replace("%d", h);
 }
 const COLOUR = {L:"#ff5050",R:"#50ff50",U:"#ffff50",D:"#ff8c50"};
 const DIR = ["L","R","U","D"];
@@ -203,7 +255,7 @@ function keyCanon(label){ if(label===t.ignore) return "(ignore)";
   for(const k of KEYS) if(keyLabel(k)===label) return k;
   return "(ignore)"; }
 
-const _tag = new Uint8Array(PW * PH), _lab = new Int32Array(PW * PH);
+let _tag = new Uint8Array(PW * PH), _lab = new Int32Array(PW * PH);
 let _blobs = [];
 function components(){
   // Connected components of the bright pixels, once per frame.  Judging each cell
@@ -250,7 +302,12 @@ function measure(){
   // filtered out of `_blobs`.  Testing membership in `_lab` alone therefore let a
   // one-pixel speck press a key, which is what produced both the crosstalk and the
   // press nobody could explain.
-  const KEY_MIN = 150, KEY_MAX = 1600;
+  // Keycap size scales with the panel: the limits were hardcoded for a 720p panel
+  // (a keycap is ~700 px there), so on the 1080p video - native pixels, keycap ~1600-2000 -
+  // every blob fell outside the ceiling and was filtered out.  That is silent: presses
+  // simply never register and the keycap scan finds nothing.
+  const K = PW / 300;
+  const KEY_MIN = 150 * K * K, KEY_MAX = 1600 * K * K;
   const blobs = all.filter(b => b.area >= KEY_MIN && b.area <= KEY_MAX);
   const byId = new Map(blobs.map(b => [b.id, b]));
   // --- direction: the ball is the big blob in the left third ------------------
@@ -265,9 +322,12 @@ function measure(){
     }
   }
   // --- buttons: a cell is down when its centre sits in its own bright disc ----
+  // If there is no ball (this video's keycast draws the ARROW KEYS as keycaps instead),
+  // the direction cells are ordinary keycaps and are detected like every other one.
+  const useBall = Object.keys(DIRPROTO).length > 0;
   const want = new Set();
   for(const k of NAMES){
-    if(DIR.includes(k)) continue;
+    if(DIR.includes(k) && useBall) continue;
     const x = Math.round(CELLS[k][0]), y = Math.round(CELLS[k][1]);
     let on = false;
     for(let dy = -2; dy <= 2 && !on; dy++) for(let dx = -2; dx <= 2 && !on; dx++){
@@ -279,7 +339,7 @@ function measure(){
   }
   for(const k of NAMES){
     const s = stat[k];
-    if(DIR.includes(k)){
+    if(DIR.includes(k) && useBall){
       // two samples in a row: the centroid can land between two positions for one frame
       s.pend = DIRSET[hit] && DIRSET[hit].includes(k) ? (s.pend || 0) + 1 : 0;
       if(s.pend >= 2 && !s.down){ s.down = true; s.n++; }
@@ -303,7 +363,18 @@ function measure(){
 }
 
 function draw(){
-  cx.drawImage(v, 0, 0, 1280, 720);
+  cx.drawImage(v, 0, 0, VW, VH);
+  if(panelRect){
+    cx.strokeStyle = "#ffd479"; cx.lineWidth = 2;
+    cx.strokeRect(panelRect.x0, panelRect.y0, panelRect.x1 - panelRect.x0,
+                  panelRect.y1 - panelRect.y0);
+  }
+  // Show the panel box itself.  Without it there is no way to see what the page thinks
+  // the panel is - and the page's idea of the box is the thing that decides whether the
+  // magnified crop and the markers can be right at all.
+  cx.strokeStyle = "#ffd479"; cx.lineWidth = 2; cx.setLineDash([6, 4]);
+  cx.strokeRect(PANEL[0], PANEL[1], PW, PH);
+  cx.setLineDash([]);
   for(const k of NAMES){
     // CELLS are PANEL-relative.  The panel view starts at the panel origin, so
     // CELLS*2 is right there, but the video canvas starts at the frame origin:
@@ -319,9 +390,10 @@ function draw(){
     cx.fillStyle = on ? "#000" : col;
     cx.font = "bold 15px sans-serif"; cx.fillText(String(NUM[k]), p[0]-5, p[1]+5);
   }
-  px.drawImage(v, PANEL[0], PANEL[1], PW, PH, 0, 0, 600, 276);
+  const psx = pc.width / PW, psy = pc.height / PH;
+  px.drawImage(v, PANEL[0], PANEL[1], PW, PH, 0, 0, pc.width, pc.height);
   for(const k of NAMES){
-    const x=CELLS[k][0]*2, y=CELLS[k][1]*2, on=stat[k].down;
+    const x = CELLS[k][0] * psx, y = CELLS[k][1] * psy, on = stat[k].down;
     const col = known[k] ? (COLOUR[k]||"#3cf") : "#888";
     px.beginPath(); px.arc(x,y,14,0,6.284); px.strokeStyle=col; px.lineWidth=2; px.stroke();
     if(on){ px.fillStyle=col; px.fill(); }
@@ -330,18 +402,105 @@ function draw(){
     px.fillStyle = on ? "#000" : col; px.font="bold 15px sans-serif";
     px.fillText(String(NUM[k]), x-6, y+6);
   }
+  // Drawn LAST, on top of the crop: this was drawn before the crop for a moment, which
+  // painted it straight over - so the box existed, tracked the grid, responded to drags,
+  // and was invisible.
+  const db = dirBox();
+  if(db){
+    px.strokeStyle = "#6cf"; px.lineWidth = 2; px.setLineDash([5, 4]);
+    px.strokeRect(db.x0 * psx, db.y0 * psy, (db.x1 - db.x0) * psx, (db.y1 - db.y0) * psy);
+    px.setLineDash([]);
+  }
 }
 
 let drag = null;
+let dirDrag = null;
+const DIRBOX_PAD = 10;
+function dirBox(){
+  // The 3x3 grid gets its own box, so it can be STRETCHED onto the ball's positions --
+  // moving it alone was not enough when the panel happens to be a different size.
+  const ks = Object.keys(DIRPROTO);
+  if(!ks.length) return null;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for(const k of ks){
+    x0 = Math.min(x0, DIRPROTO[k][0]); y0 = Math.min(y0, DIRPROTO[k][1]);
+    x1 = Math.max(x1, DIRPROTO[k][0]); y1 = Math.max(y1, DIRPROTO[k][1]);
+  }
+  return {x0: x0 - DIRBOX_PAD, y0: y0 - DIRBOX_PAD, x1: x1 + DIRBOX_PAD, y1: y1 + DIRBOX_PAD};
+}
+function dirBoxHit(b, x, y){
+  if(!b) return null;
+  const t = 12;
+  const nearL = Math.abs(x - b.x0) <= t, nearR = Math.abs(x - b.x1) <= t;
+  const nearT = Math.abs(y - b.y0) <= t, nearB = Math.abs(y - b.y1) <= t;
+  if(x < b.x0 - t || x > b.x1 + t || y < b.y0 - t || y > b.y1 + t) return null;
+  if(nearT && nearL) return "dirnw"; if(nearT && nearR) return "dirne";
+  if(nearB && nearL) return "dirsw"; if(nearB && nearR) return "dirse";
+  if(nearL) return "dirleft"; if(nearR) return "dirright";
+  if(nearT) return "dirtop";  if(nearB) return "dirbottom";
+  return "dirmove";
+}
 pc.onmousedown = ev => {
   const r = pc.getBoundingClientRect();
   const x = (ev.clientX - r.left) / r.width * PW, y = (ev.clientY - r.top) / r.height * PH;
+  // The direction grid moves as a GROUP.  Grabbing any of its nine ball positions - the
+  // four that are also cells, and the five that are not - moves the whole 3x3, because
+  // the decoder classifies the ball against all nine prototypes and moving one alone
+  // would leave it with a grid that no longer matches the ball.
+  for(const k in DIRPROTO){
+    if(Math.hypot(DIRPROTO[k][0] - x, DIRPROTO[k][1] - y) < 12){
+      dirDrag = {mode: "dirmove", x, y, box: dirBox(),
+                 proto: JSON.parse(JSON.stringify(DIRPROTO))};
+      ev.preventDefault(); return;
+    }
+  }
+  const dbh = dirBoxHit(dirBox(), x, y);
+  if(dbh && dbh !== "dirmove"){
+    dirDrag = {mode: dbh, x, y, box: dirBox(),
+               proto: JSON.parse(JSON.stringify(DIRPROTO))};
+    ev.preventDefault(); return;
+  }
+  if(dbh === "dirmove"){
+    dirDrag = {mode: "dirmove", x, y, box: dirBox(),
+               proto: JSON.parse(JSON.stringify(DIRPROTO))};
+    ev.preventDefault(); return;
+  }
   for(const k of NAMES){
-    if(DIR.includes(k)) continue;              // the 3x3 grid is measured, not dragged
+    if(DIR.includes(k)) continue;              // direction cells move with the group
     if(Math.hypot(CELLS[k][0]-x, CELLS[k][1]-y) < 12){ drag = k; ev.preventDefault(); return; }
   }
 };
 pc.onmousemove = ev => {
+  if(dirDrag){
+    const r = pc.getBoundingClientRect();
+    const x = (ev.clientX - r.left) / r.width * PW, y = (ev.clientY - r.top) / r.height * PH;
+    const b = dirDrag.box, m = dirDrag.mode;
+    if(m === "dirmove"){
+      const dx = x - dirDrag.x, dy = y - dirDrag.y;
+      for(const k in DIRPROTO){ DIRPROTO[k] = [DIRPROTO[k][0] + dx, DIRPROTO[k][1] + dy]; }
+      dirDrag.x = x; dirDrag.y = y;           // incremental, so no rounding drift
+    } else {
+      // Stretch: the box edges move, and the nine points follow proportionally - the grid
+      // keeps its shape instead of being distorted point by point.
+      let x0 = b.x0, y0 = b.y0, x1 = b.x1, y1 = b.y1;
+      if(m === "dirleft" || m === "dirnw" || m === "dirsw") x0 = x;
+      if(m === "dirright" || m === "dirne" || m === "dirse") x1 = x;
+      if(m === "dirtop" || m === "dirnw" || m === "dirne") y0 = y;
+      if(m === "dirbottom" || m === "dirsw" || m === "dirse") y1 = y;
+      if(x1 - x0 > 8 && y1 - y0 > 8){
+        const sx = (x1 - x0) / (b.x1 - b.x0), sy = (y1 - y0) / (b.y1 - b.y0);
+        for(const k in dirDrag.proto){
+          const p = dirDrag.proto[k];
+          DIRPROTO[k] = [x0 + (p[0] - b.x0) * sx, y0 + (p[1] - b.y0) * sy];
+        }
+      }
+    }
+    for(const k of DIR){
+      if(CELLS[k]) CELLS[k] = [Math.round(DIRPROTO[k][0]), Math.round(DIRPROTO[k][1])];
+    }
+    draw();
+    return;
+  }
   if(!drag) return;
   const r = pc.getBoundingClientRect();
   CELLS[drag] = [Math.round((ev.clientX - r.left) / r.width * PW),
@@ -350,6 +509,15 @@ pc.onmousemove = ev => {
 };
 let justDragged = false;
 pc.onmouseup = () => {
+  if(dirDrag){
+    // Same guard as a single-marker drag: the click that follows this mouseup would
+    // otherwise add a cell.  Leaving it out here was the second time this bug appeared.
+    dirDrag = null; justDragged = true;
+    setTimeout(()=>{ justDragged = false; }, 0);
+    postCells();
+    document.getElementById('status').textContent = t.dirMoved;
+    return;
+  }
   if(drag){ const k = drag; drag = null; justDragged = true;
     setTimeout(()=>{ justDragged = false; }, 0);   // cleared after the click that follows
     postCells();
@@ -366,8 +534,14 @@ pc.onclick = ev => {
   const r = pc.getBoundingClientRect();
   const x = (ev.clientX - r.left) / r.width * PW;
   const y = (ev.clientY - r.top) / r.height * PH;
+  // Any existing marker, INCLUDING the five ball positions that are not cells
+  // (neutral and the four diagonals): grabbing the grid by a diagonal and releasing
+  // there used to be far enough from every cell to slip past this test.
   for(const k of NAMES){
-    if(Math.hypot(CELLS[k][0]-x, CELLS[k][1]-y) < 14) return;   // hit an existing marker
+    if(Math.hypot(CELLS[k][0]-x, CELLS[k][1]-y) < 14) return;
+  }
+  for(const k in DIRPROTO){
+    if(Math.hypot(DIRPROTO[k][0]-x, DIRPROTO[k][1]-y) < 14) return;
   }
   let i = 1; while(CELLS["x"+i]) i++;
   const name = "x"+i;
@@ -404,7 +578,7 @@ function buildTable(){
   }
   document.querySelectorAll('select[data-cell]').forEach(sel =>
     sel.onchange = () => { mapping[sel.dataset.cell] = sel.value; selected = sel.dataset.cell;
-      fetch('/api/mapping',{method:'POST',body:JSON.stringify(mapping)});
+      fetch('/api/mapping',{method:'POST',body:JSON.stringify(mappingPayload())});
       updateTable(); });                      // NOT buildTable: that closed the menu
   document.querySelectorAll('button[data-jump]').forEach(btn =>
     btn.onclick = () => { const [c,d] = btn.dataset.jump.split(':');
@@ -418,6 +592,9 @@ function buildTable(){
 }
 
 function updateTable(){
+  const pn = document.getElementById('panelinfo');
+  if(pn) pn.textContent = t.panelNow.replace("%d", PANEL[0]).replace("%d", PANEL[1])
+                                 .replace("%d", PW).replace("%d", PH);
   for(const k of NAMES){
     const r = rowRefs[k]; if(!r) continue;
     const s = stat[k];
@@ -431,9 +608,10 @@ function updateTable(){
 function applyLang(){
   t = S[lang];
   document.title = t.title;
+  updateTable();
   for(const [id,key] of [["h","h"],["b-start","start"],["b-back","back"],["b-prev","prev"],
       ["b-next","next"],["b-fwd","fwd"],["b-save","save"],["b-scan","scan"],
-      ["b-scanstop","scanStop"],["b-discover","discover"],
+      ["b-discover","discover"],
       ["l-speed","speed"],
       ["l-lang","lang"],["l-zoom","zoom"],["l-panel","panel"],["l-table","table"],
       ["hint","hint"]])
@@ -442,7 +620,109 @@ function applyLang(){
   buildTable();
 }
 
+// Redrawing the box from scratch is Shift+drag on the frame.  It used to be a button,
+// which is redundant now that the box can be dragged and resized directly - but the
+// capability stays, because a box that is somehow wrong must still be replaceable.
+// The panel box is directly manipulable: drag inside it to move it, drag an edge or a
+// corner to resize.  A crop window cannot be right if the only way to adjust it is to
+// redraw it from scratch, and the box decides whether every cell sits on its keycap.
+const BOX_TOL = 14;                     // frame pixels - 8 was too small to hit reliably
+function boxHit(x, y){
+  const x0 = PANEL[0], y0 = PANEL[1], x1 = x0 + PW, y1 = y0 + PH;
+  const nearL = Math.abs(x - x0) <= BOX_TOL, nearR = Math.abs(x - x1) <= BOX_TOL;
+  const nearT = Math.abs(y - y0) <= BOX_TOL, nearB = Math.abs(y - y1) <= BOX_TOL;
+  if(x < x0 - BOX_TOL || x > x1 + BOX_TOL || y < y0 - BOX_TOL || y > y1 + BOX_TOL) return null;
+  if(nearT && nearL) return "nw"; if(nearT && nearR) return "ne";
+  if(nearB && nearL) return "sw"; if(nearB && nearR) return "se";
+  if(nearL) return "left";  if(nearR) return "right";
+  if(nearT) return "top";   if(nearB) return "bottom";
+  return "move";
+}
+function cursorFor(h){
+  if(!h) return panelMode ? "crosshair" : "default";
+  if(h === "move") return "move";
+  if(h === "left" || h === "right") return "ew-resize";
+  if(h === "top" || h === "bottom") return "ns-resize";
+  return (h === "nw" || h === "se") ? "nwse-resize" : "nesw-resize";
+}
+function frameXY(ev){
+  const r = cv.getBoundingClientRect();
+  return [(ev.clientX - r.left) / r.width * VW, (ev.clientY - r.top) / r.height * VH];
+}
+let boxDrag = null;
+cv.onmousedown = ev => {
+  const [x, y] = frameXY(ev);
+  if(ev.shiftKey){                       // Shift+drag redraws the box from scratch
+    panelMode = true; boxDrag = null;
+    panelRect = {x0: x, y0: y, x1: x, y1: y};
+    ev.preventDefault();
+    return;
+  }
+  const h = boxHit(x, y);
+  if(h){
+    boxDrag = {mode: h, x, y, box: [PANEL[0], PANEL[1], PW, PH]};
+    ev.preventDefault();
+    return;
+  }
+  if(panelMode){
+    panelRect = {x0: x, y0: y, x1: x, y1: y};
+    ev.preventDefault();
+  }
+};
+cv.onmousemove = ev => {
+  const [x, y] = frameXY(ev);
+  if(boxDrag){
+    const b = boxDrag.box, dx = x - boxDrag.x, dy = y - boxDrag.y;
+    let x0 = b[0], y0 = b[1], x1 = b[0] + b[2], y1 = b[1] + b[3];
+    // Explicitly, not by substring: "nw"/"se"/"ne"/"sw" contain no 'l', 'r' or 'b', so
+    // indexOf() made every CORNER a no-op - which is why dragging a corner appeared to
+    // do nothing at all.
+    const m = boxDrag.mode;
+    if(m === "move"){ x0 += dx; y0 += dy; x1 += dx; y1 += dy; }
+    else {
+      if(m === "left" || m === "nw" || m === "sw") x0 += dx;
+      if(m === "right" || m === "ne" || m === "se") x1 += dx;
+      if(m === "top" || m === "nw" || m === "ne") y0 += dy;
+      if(m === "bottom" || m === "sw" || m === "se") y1 += dy;
+    }
+    x0 = Math.max(0, Math.min(x0, VW - 10)); y0 = Math.max(0, Math.min(y0, VH - 10));
+    x1 = Math.max(x0 + 40, Math.min(x1, VW)); y1 = Math.max(y0 + 30, Math.min(y1, VH));
+    panelRect = {x0, y0, x1, y1};
+    ev.preventDefault();
+    return;
+  }
+  const hov = boxHit(x, y);
+  cv.style.cursor = cursorFor(hov);
+  const hb = document.getElementById('handle');
+  if(hb) hb.textContent = hov ? ("handle: " + hov) : "";
+  if(panelMode && panelRect){
+    panelRect.x1 = x; panelRect.y1 = y;
+  }
+};
+cv.onmouseup = () => {
+  if(boxDrag){
+    if(panelRect){
+      applyPanel(Math.round(panelRect.x0), Math.round(panelRect.y0),
+                 Math.round(panelRect.x1 - panelRect.x0),
+                 Math.round(panelRect.y1 - panelRect.y0));
+    }
+    boxDrag = null; panelRect = null;
+    return;
+  }
+  if(!panelMode || !panelRect) return;
+  const x0 = Math.max(0, Math.round(Math.min(panelRect.x0, panelRect.x1)));
+  const y0 = Math.max(0, Math.round(Math.min(panelRect.y0, panelRect.y1)));
+  const x1 = Math.min(VW, Math.round(Math.max(panelRect.x0, panelRect.x1)));
+  const y1 = Math.min(VH, Math.round(Math.max(panelRect.y0, panelRect.y1)));
+  panelRect = null; panelMode = false;
+  if(x1 - x0 < 40 || y1 - y0 < 30){
+    document.getElementById('status').textContent = t.panelHint; return;
+  }
+  applyPanel(x0, y0, x1 - x0, y1 - y0);
+};
 window.addEventListener('keydown', ev => {
+  if(ev.key === "Escape" && panelMode){ panelMode = false; panelRect = null;
+    document.getElementById('status').textContent = ""; return; }
   // Never hijack keys while a control has focus: arrow keys inside the mapping
   // dropdown choose an option, and stealing them would also seek the video.
   const tag = (ev.target && ev.target.tagName || "").toLowerCase();
@@ -469,12 +749,40 @@ document.getElementById('b-next').onclick = () => step(1/30);
 document.getElementById('b-back').onclick = () => { v.currentTime -= 5; };
 document.getElementById('b-fwd').onclick = () => { v.currentTime += 5; };
 document.getElementById('b-start').onclick = () => { v.currentTime = 0; };
+function mappingPayload(){
+  // Send EVERY cell, always.  The payload used to be the `mapping` object, which only gained
+  // an entry when its dropdown was changed, and the server REPLACES the file with what it
+  // receives - so a cell nobody had touched was missing from the payload and the next
+  // unrelated change deleted its assignment.  That is how video 1 lost x6 -> item.
+  const out = {};
+  for(const k of NAMES){
+    const s = document.querySelector(`select[data-cell="${k}"]`);
+    out[k] = s ? s.value : (mapping[k] || "(ignore)");
+  }
+  return out;
+}
 document.getElementById('b-save').onclick = () =>
-  fetch('/api/mapping',{method:'POST',body:JSON.stringify(mapping)})
-    .then(()=>document.getElementById('status').textContent = t.saved);
+  fetch('/api/mapping',{method:'POST',body:JSON.stringify(mappingPayload())})
+    .then(()=>document.getElementById('status').textContent =
+      t.saved + " (" + NAMES.length + " cells)");
 document.getElementById('speed').onchange = e => { v.playbackRate = parseFloat(e.target.value); };
 document.getElementById('zoom').onchange = e => { const z = parseFloat(e.target.value);
-  cv.style.width = (1280*z) + "px"; cv.style.height = (720*z) + "px"; };
+  cv.style.width = (VW*z) + "px"; cv.style.height = (VH*z) + "px"; };
+function fitZoom(){
+  // A 1920 px wide canvas next to the table is unusable, so the default is whatever
+  // comes out near 900 px wide, rounded down to a choice the menu actually offers.
+  const menu = Array.from(document.getElementById('zoom').options).map(o => parseFloat(o.value));
+  const want = Math.min(1, 900 / VW);
+  return menu.filter(z => z <= want + 1e-6).pop() || menu[0];
+}
+v.addEventListener('loadedmetadata', () => {
+  VW = v.videoWidth || 1280; VH = v.videoHeight || 720;
+  cv.width = VW; cv.height = VH;                 // native space, CSS-only scaling
+  const z = fitZoom();
+  document.getElementById('zoom').value = String(z);
+  cv.style.width = (VW*z) + "px"; cv.style.height = (VH*z) + "px";
+  document.getElementById('status').textContent = "frame " + VW + "x" + VH;
+});
 function step(dt){ v.pause(); v.currentTime = Math.max(0, v.currentTime + dt); }
 function jump(cell, dir){
   // "where is this key pressed" - the identification workhorse.  Only intervals
@@ -500,6 +808,11 @@ function seekTo(t){
 }
 let discovering = false;
 document.getElementById('b-discover').onclick = async () => {
+  const btn = document.getElementById('b-discover');
+  if(discovering){                       // pressing it again stops it
+    discovering = false; btn.textContent = t.discover; return;
+  }
+  btn.textContent = t.scanStop;
   // Positions, not presses: sample one frame every few seconds and collect the
   // centroids of keycap-sized bright blobs.  A keycap that is never pressed cannot
   // be found this way, but one that lights up even twice is enough to locate it -
@@ -510,7 +823,11 @@ document.getElementById('b-discover').onclick = async () => {
   // 1 s steps: at 3 s a keycap held for half a second is missed 5 times out of 6, and
   // the rare keycaps are exactly the ones this button exists to find.
   const st = document.getElementById('status'), step = 1, pts = [];
-  for(let t = 0; t < v.duration - 0.05 && discovering; t += step){
+  // From the CURRENT frame, like the playback scan: once the keycaps you care about have
+  // been found there is nothing to gain from re-walking the start of the video, and the
+  // points already collected are not thrown away either (each run only adds cells for
+  // positions that no existing cell covers).
+  for(let t = v.currentTime; t < v.duration - 0.05 && discovering; t += step){
     await seekTo(t);
     for(const b of components()){
       if(b.area < 150 || b.area > 1600) continue;
@@ -519,6 +836,9 @@ document.getElementById('b-discover').onclick = async () => {
     }
     st.textContent = S[lang].discovering.replace("%d", Math.round(100 * t / v.duration));
   }
+  // Cancelling must not throw away the work: the points already collected are
+  // processed exactly as if the scan had finished early.
+  const stopped = !discovering;
   const clusters = [];
   for(const [x, y] of pts){
     let hit = null;
@@ -537,14 +857,25 @@ document.getElementById('b-discover').onclick = async () => {
     added++;
   }
   discovering = false;
+  document.getElementById('b-discover').textContent = t.discover;
   syncCells(); postCells(); buildTable();
-  st.textContent = added ? S[lang].discoverDone.replace("%d", clusters.length).replace("%d", added)
-                         : S[lang].discoverNone;
+  // Report the numbers at every stage.  "Nothing happened" is not a symptom one can act
+  // on: 0 points means the frame was not decoded, points but 0 clusters means the
+  // clustering, clusters but 0 added means everything is already covered.
+  const summary = "found " + pts.length + " bright spots -> " + clusters.length
+                + " positions -> " + added + " cells added (now " + NAMES.length + ")";
+  st.textContent = (stopped ? S[lang].discoverStopped.replace("%d", added)
+                  : added ? S[lang].discoverDone.replace("%d", clusters.length).replace("%d", added)
+                          : S[lang].discoverNone) + " | " + summary;
 };
 let scanning = false;
 document.getElementById('b-scan').onclick = async () => {
-  if(scanning) return;
+  const btn = document.getElementById('b-scan');
+  if(scanning){                          // pressing it again stops it
+    scanning = false; btn.textContent = t.scan; return;
+  }
   scanning = true;
+  btn.textContent = t.scanStop;
   // Scan FORWARD FROM HERE, keeping what is already known: once every key has been
   // identified there is nothing to gain from re-walking the first 40 minutes, and
   // throwing the collected intervals away each time was pure loss.
@@ -554,16 +885,13 @@ document.getElementById('b-scan').onclick = async () => {
   const tick = () => {
     st.textContent = t.scanning.replace("%d", Math.round(100*v.currentTime/v.duration));
     if(scanning && !v.ended && v.currentTime < v.duration - 0.05) setTimeout(tick, 300);
-    else { scanning = false; v.pause(); v.playbackRate = rate;
+    else { scanning = false; document.getElementById('b-scan').textContent = t.scan;
+           v.pause(); v.playbackRate = rate;
            st.textContent = scanning ? t.scanStopped : t.scanDone; updateTable(); }
   };
   tick();
 };
-document.getElementById('b-scanstop').onclick = () => {
-  const was = scanning;
-  scanning = false;
-  document.getElementById('status').textContent = was ? t.scanStopped : "";
-};
+// No separate stop button: each scan's own button becomes 停止 while it runs.
 v.onplay = () => document.getElementById('b-play').textContent = t.pause;
 v.onpause = () => document.getElementById('b-play').textContent = t.play;
 const seek = document.getElementById('seek');
@@ -579,6 +907,13 @@ function loop(){
 }
 let lastTable = 0;
 setInterval(updateTable, 300);   // text only: never rebuild the selects
+// The magnified view is derived from the panel box, never hardcoded: with a 330x170
+// panel (a 1080p video) a fixed 600x276 canvas stretches the crop AND puts every marker
+// at the wrong place.  This has to run AFTER the canvas is looked up - assigning it here
+// rather than next to the panel variables is deliberate, because `const pc` is declared
+// further down and touching it earlier throws a TDZ ReferenceError, which kills the
+// whole script (the page then shows nothing but its HTML skeleton).
+pc.width = PW * 2; pc.height = PH * 2;
 applyLang(); loop();
 </script></body></html>
 """
@@ -605,8 +940,9 @@ class Server(BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             html = (PAGE
                     .replace("__CELLS__", json.dumps(self.cells or DEFAULT_CELLS))
-                    .replace("__PANEL__", json.dumps(list(PANEL)))
-                    .replace("__PW__", str(PANEL_W)).replace("__PH__", str(PANEL_H))
+                    .replace("__PANEL__", json.dumps(self.panel))
+                    .replace("__PW__", str(self.panel_size[0]))
+                    .replace("__PH__", str(self.panel_size[1]))
                     .replace("__KEYS__", json.dumps(self.keys))
                     .replace("__MAPPING__", json.dumps(self.mapping))
                     .replace("__DIRPROTO__", json.dumps(self.dir_proto))
@@ -653,12 +989,26 @@ class Server(BaseHTTPRequestHandler):
                 data = json.loads(self.rfile.read(n) or b"{}")
                 cells = {str(k): [int(v[0]), int(v[1])]
                          for k, v in (data.get("cells") or {}).items()}
+                panel = [int(v) for v in (data.get("panel") or [])]
+                psize = [int(v) for v in (data.get("panel_size") or [])]
+                proto = {str(k): [int(round(v[0])), int(round(v[1]))]
+                         for k, v in (data.get("dir_proto") or {}).items()}
             except (ValueError, TypeError, IndexError):
                 self._send(b"bad json", "text/plain", 400)
                 return
+            if len(panel) == 2 and len(psize) == 2 and psize[0] > 20 and psize[1] > 20:
+                # The box is the user's, measured on the frame - accept it, it is the
+                # only thing that fixes a layout whose crop was wrong.
+                type(self).panel = panel
+                type(self).panel_size = psize
+            if proto:
+                type(self).dir_proto = proto      # scaled with the box, so it must be saved
             type(self).cells = cells
             blob = load_json(self.cells_path)          # keep dir_proto and anything else
-            blob.update({"video": self.video.name, "panel": list(PANEL), "cells": cells})
+            blob.update({"video": self.video.name, "panel": type(self).panel,
+                         "panel_size": type(self).panel_size, "cells": cells})
+            if type(self).dir_proto:
+                blob["dir_proto"] = type(self).dir_proto
             atomic_write(self.cells_path, blob)
             self._send(b'{"ok":true}', "application/json")
             return
@@ -684,6 +1034,8 @@ class Server(BaseHTTPRequestHandler):
         self._send(b'{"ok":true}', "application/json")
 
     keys: list[str] = []
+    panel: list = list(PANEL)
+    panel_size: list = [PANEL_W, PANEL_H]
     cells: dict = {}
     cells_path: Path = Path("runs/cells.json")
     dir_proto: dict = {}
@@ -723,19 +1075,30 @@ def main() -> int:
         if got:
             Server.cells = {k: list(v) for k, v in got.items()}
             print("cells: %d loaded from %s" % (len(Server.cells), cells_path))
+        if blob.get("panel") and blob.get("panel_size"):
+            # The box is per video and saved with the cells.  Without this the server
+            # falls back to the 720p default, which for a 1080p video is the middle of the
+            # game - and nothing fails loudly: the page just crops the wrong region, the
+            # same symptom as a wrong box.
+            Server.panel = [int(v) for v in blob["panel"]]
+            Server.panel_size = [int(v) for v in blob["panel_size"]]
+            print("panel: %s size %s from %s" % (Server.panel, Server.panel_size, cells_path))
         if blob.get("dir_proto"):
             Server.dir_proto = {k: list(v) for k, v in blob["dir_proto"].items()}
             print("directions: %d positions (3x3 grid)" % len(Server.dir_proto))
         else:
-            print("WARNING: %s has no dir_proto - directions will not be decoded"
-                  % cells_path)
+            print("no dir_proto in %s: directions are read from the four keycaps "
+                  "(this video draws the arrow keys, not a ball)" % cells_path)
     Server.cells_path = cells_path
     Server.video = video
     Server.mapping_path = mapping_path
     Server.keys = keys
     Server.mapping = {k: "(ignore)" for k in DEFAULT_CELLS}
     # L/R were pinned offline by camera shift + occupation; seed them.
-    Server.mapping.update({"L": "left", "R": "right"})
+    # All four directions have unambiguous defaults; only the action buttons need a human
+    # to look at the panel and decide.  Seeding just L/R left U/D unassigned, which reads
+    # as "not identified" for keys nobody has to identify.
+    Server.mapping.update({"L": "left", "R": "right", "U": "up", "D": "down"})
     if mapping_path.exists():
         try:
             got = json.loads(mapping_path.read_text()).get("cells") or {}

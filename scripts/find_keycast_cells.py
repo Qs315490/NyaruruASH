@@ -41,20 +41,25 @@ def main() -> int:
     ap.add_argument("--video", required=True)
     ap.add_argument("--samples", type=int, default=500)
     ap.add_argument("--panel", default="%d,%d" % PANEL)
+    ap.add_argument("--panel-size", default="%d,%d" % (PANEL_W, PANEL_H),
+                    help="panel width,height - 1080p videos have bigger keycaps")
     ap.add_argument("--min-area", type=int, default=200, help="pressed keycap area, px")
     ap.add_argument("--bright", type=int, default=170, help="pressed keycap mean value")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     px, py = (int(v) for v in args.panel.split(","))
+    pw, ph = (int(v) for v in args.panel_size.split(","))
     out = Path(args.out) if args.out else \
         Path("runs") / ("keycast-cells-%s.json" % Path(args.video).stem)
 
-    dur = float(subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-show_entries", "format=duration",
          "-of", "default=nw=1:nk=1", args.video],
-        capture_output=True, text=True, check=True).stdout.strip())
+        capture_output=True, text=True, check=True).stdout.split()
+    w_full, h_full, dur = int(float(probe[0])), int(float(probe[1])), float(probe[2])
 
-    vote = np.zeros((PANEL_H, PANEL_W), np.float32)
+    vote = np.zeros((ph, pw), np.float32)
     hits, frames = 0, 0
     for i in range(args.samples):
         t = dur * (i + 0.5) / args.samples
@@ -62,9 +67,9 @@ def main() -> int:
             ["ffmpeg", "-v", "error", "-ss", "%.2f" % t, "-i", args.video,
              "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
             capture_output=True, check=True).stdout
-        if len(raw) != 1280 * 720:
+        if len(raw) != w_full * h_full:
             continue
-        g = np.frombuffer(raw, np.uint8).reshape(720, 1280)[py:py + PANEL_H, px:px + PANEL_W]
+        g = np.frombuffer(raw, np.uint8).reshape(h_full, w_full)[py:py + ph, px:px + pw]
         frames += 1
         m = (g > 150).astype(np.uint8)
         n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
@@ -75,7 +80,7 @@ def main() -> int:
             if float(g[lab == j].mean()) < args.bright:
                 continue
             cxx, cyy = int(round(cent[j][0])), int(round(cent[j][1]))
-            if 0 <= cyy < PANEL_H and 0 <= cxx < PANEL_W:
+            if 0 <= cyy < ph and 0 <= cxx < pw:
                 vote[cyy, cxx] += 1
                 hits += 1
     print("sampled %d frames | %d pressed-keycap hits | %.2f keys down per frame"
