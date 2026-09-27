@@ -88,16 +88,23 @@
      scene we are willing to press buttons in. */
   V.GAMEPLAY_SCENE = "Scene_Map";
 
-  /* Scenes that need exactly one "ok" to continue and where ok commits nothing
-     destructive - the game's own transition screens.  They are input-gated, so
-     refusing all input does not protect anything: it just parks the game there
-     forever.  That is not hypothetical, it happened.
+  /* Scenes where exactly one "ok" is both required and harmless.
 
-     Menus are deliberately NOT here.  On Scene_Title/Scene_Menu/Scene_File the
-     same ok press selects a menu entry, which is how a live run loaded the
-     player's save.  This list may only ever contain screens whose ok does one
-     thing: continue. */
-  V.CONFIRM_SCENES = ["Scene_Transport"];
+     EMPTY ON PURPOSE, and it must stay empty until a screen is *proven* to
+     need ok and to commit nothing.
+
+     Scene_Transport was briefly listed here on the theory that it was a
+     transition screen that needed one ok to continue.  It is not: it is the
+     TELEPORT DESTINATION SELECTION MENU, so ok there picks a teleport target.
+     Pressing it was a menu selection - precisely the failure this whole gate
+     exists to prevent - and the agent teleported the player somewhere it did
+     not choose, onto a damage trap.
+
+     A screen belongs here only if its ok does exactly one thing: continue.  If
+     ok selects among entries, or its effect depends on what is highlighted, it
+     is a menu and belongs on the forbidden side no matter how harmless the
+     screen looks. */
+  V.CONFIRM_SCENES = [];
 
   V.safety = function () {
     var scene = V.sceneName();
@@ -105,9 +112,34 @@
       var m = window.$gameMessage;
       return !!(m && m.isBusy && m.isBusy());
     });
+    /* A message that is WAITING FOR A CHOICE is a decision point, not dialogue.
+
+       This matters even though the scene is Scene_Map: the ok key (Z, which the
+       policy uses for jump) answers the choice, so free gameplay input commits
+       whichever option happens to be highlighted.  The difficulty statue is
+       exactly this, and a difficulty pick is not something a safety layer gets
+       to make.  MZ signals "awaiting" with a live _choiceCallback; the choices
+       array is reported too because games reimplement this. */
+    var awaiting = guard("messageChoice", function () {
+      var m = window.$gameMessage;
+      if (!m) { return false; }
+      if (m._choiceCallback) { return true; }
+      var choices = (typeof m.choices === "function") ? m.choices() : null;
+      return !!(choices && choices.length > 0 && m.isBusy && m.isBusy());
+    });
+    /* Is the engine's own loop actually running?  Realtime driving depends on
+       it, and a stopped ticker is invisible from the outside: the game sits in
+       Scene_Map, every safety check passes, and a whole round of "self-play"
+       collects a frozen picture.  Report it so the caller can refuse. */
+    var ticking = guard("tickerRunning", function () {
+      var t = window.Graphics && Graphics.app && Graphics.app.ticker;
+      return !!(t && t.started);
+    });
     return {
       scene: scene,
       messageBusy: !!busy,
+      awaitingChoice: !!awaiting,
+      tickerRunning: !!ticking,
       // Only Scene_Map takes gameplay verbs.  sceneName() returns null both
       // before the game boots and when the read throws, and null !==
       // GAMEPLAY_SCENE, so the fail-closed case is handled by this comparison.

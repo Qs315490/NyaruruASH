@@ -40,14 +40,17 @@ class _FakeConn:
         self.payload = None if payload is None else json.dumps(payload)
         self.calls: list[tuple[str, object]] = []
         self.evals: list[str] = []
+        self.events: list[str] = []   # ordered, for ordering assertions
         self.closed = False
 
     def call(self, method, params=None, timeout=None):
         self.calls.append((method, params))
+        self.events.append("call:%s:%s" % (method, (params or {}).get("type", "")))
         return None
 
     def evaluate(self, expr, timeout=None):
         self.evals.append(expr)
+        self.events.append("eval:%s" % expr)
         if "__ash.safety" in expr:
             return self.payload
         if "pump.resume" in expr:
@@ -267,6 +270,64 @@ def test_press_ok_dispatches_only_the_configured_ok_button():
     assert keys, "the ok button must actually be pressed"
     pressed = {c[1]["key"] for c in keys if c[1].get("type") == "rawKeyDown"}
     assert pressed and pressed <= {"z"}, "only the ok key, never a random action"
+
+
+def test_press_ok_holds_the_key_across_a_frame():
+    """Down and up must straddle a game frame, or the confirm edge is missed.
+
+    The engine samples Input on the frames it runs; dispatching both events
+    back-to-back leaves every frame seeing an idle keyboard.
+    """
+    env = _env(GAMEPLAY)
+    env.conn = _FakeConn(CONFIRM)  # type: ignore[assignment]
+    env._pump_installed = True
+    env.press_ok()
+
+    down = next(i for i, e in enumerate(env.conn.events) if "rawKeyDown" in e)
+    up = next(i for i, e in enumerate(env.conn.events) if "keyUp" in e)
+    pumps = [i for i, e in enumerate(env.conn.events) if "pump.pump" in e]
+    assert any(down < p < up for p in pumps), "the key must be held across a frame"
+    assert any(p > up for p in pumps), "and released on a later frame"
+
+
+def test_scene_map_with_a_pending_choice_is_unsafe():
+    """Scene_Map is not enough: ok answers a waiting choice.
+
+    The difficulty statue is a dialogue with choices, and the policy's jump key
+    is the ok key.  Free gameplay input there would pick an option, so a pending
+    choice must block input even in normal gameplay.
+    """
+    payload = {"scene": "Scene_Map", "messageBusy": True, "inGameplay": True,
+               "awaitingChoice": True}
+    env = _env(payload)
+
+    reason = env.unsafe_reason()
+    assert reason and "choice" in reason
+    assert env.is_confirm_scene() is False, "a choice must not be ok-pressed away"
+    with pytest.raises(UnsafeSceneError):
+        env.press_ok()
+
+
+def test_plain_dialogue_on_the_map_still_behaves_as_gameplay():
+    """A message without choices is just text; it must not block the round."""
+    payload = {"scene": "Scene_Map", "messageBusy": True, "inGameplay": True,
+               "awaitingChoice": False}
+    assert _env(payload).unsafe_reason() is None
+
+
+def test_runner_aborts_on_a_pending_dialogue_choice():
+    pytest.importorskip("hdbscan")
+    from ash.env.fake_backend import FakeSpeedrunEnv
+
+    env = FakeSpeedrunEnv()
+    stepped: list[object] = []
+    env.step = lambda *a, **k: stepped.append(a)  # type: ignore[method-assign]
+    env.unsafe_reason = lambda: "a dialogue choice is awaiting an answer"  # type: ignore[method-assign]
+
+    out = _runner_for(env, frame_skip=1).run([env], delta=6, timeout_s=5)
+
+    assert out["aborted"] and "choice" in out["aborted"]
+    assert stepped == [], "no key may be pressed while a choice is waiting"
 
 
 def test_confirm_flag_comes_from_the_probe():

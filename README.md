@@ -109,7 +109,7 @@ AGENTS.md     项目工作文档入口
 
 ## 状态
 
-- [x] 核心模块与回归测试（73 passed）
+- [x] 核心模块与回归测试（99 passed）
 - [x] 实机输入安全护栏（场景探针 + 后端硬闸 + runner 中止 + **确认场景白名单**，
       `tests/test_safety.py`）；真机只读验证通过：游戏内 `__ash.safety()` →
       `{"scene":"Scene_Map","inGameplay":true}`，过场 → `{"scene":"Scene_Transport","confirm":true}`
@@ -138,4 +138,9 @@ AGENTS.md     项目工作文档入口
 - [x] 已加护栏：伪标签退化（某一类 >90%）时**拒绝更新 π** 并报错，而不是静默地把它
       训成常量。已在两个真实退化 checkpoint 上验证会触发
       （`tests/test_pseudo_labels.py`）
+- [x] **实机驱动改为实时模式**：帧泵会改变游戏行为（同陷阱 A/B 实测：真实 ticker 会传送、
+      帧泵 1200 帧钉在受伤态不传送），自博弈改用 `drive="realtime"`
+- [ ] **实机操作已暂停（决定，2026-09-24）**：在「agent 的输入确实能驱动角色、
+      且伤害/死亡/菜单等场景都有可靠处置」被证据验证之前，不再对游戏发任何输入。
+      停止前的事故见 `docs/pitfalls.md` 第 14 条。
 - [ ] 实机长跑（`--max-bootstraps > 1`）：等 IDM 的伪标签有信号后再谈

@@ -74,7 +74,21 @@ class CdpSpeedrunEnv:
         target_index: int = 0,
         auto_connect: bool = True,
         enforce_safety: bool = True,
+        drive: str = "pump",
     ) -> None:
+        #: How frames get advanced.
+        #:
+        #: "pump"     - the agent takes the ticker and advances frames by hand.
+        #:              Required for deterministic replay/search, but it CHANGES
+        #:              the game: with a synthetic ticker clock this game's hurt
+        #:              state never exits (measured: 1200 pumped frames pinned at
+        #:              _pRealState 6, and a trap that teleports correctly under
+        #:              the engine's own loop never resolved).
+        #: "realtime" - the engine keeps its loop; the agent only dispatches
+        #:              input on a real-time schedule.  Self-play must use this.
+        if drive not in ("pump", "realtime"):
+            raise ValueError("drive must be 'pump' or 'realtime', got %r" % (drive,))
+        self.drive = drive
         #: Refuse to dispatch gameplay input outside Scene_Map.  Only the
         #: diagnostic key probes opt out, and they do so explicitly - the
         #: default has to be safe, because the failure it prevents (an
@@ -127,16 +141,37 @@ class CdpSpeedrunEnv:
         return self
 
     def install(self, *, seed: int | None = None) -> dict[str, Any]:
-        """Inject the in-page agent and start frame capture."""
+        """Inject the in-page agent; hand-drive frames only in pump mode."""
         if self.conn is None:
             raise CdpError("not connected")
         # Also registered for future documents, so a page reload does not
         # silently lose the agent.
         self.conn.call("Page.addScriptToEvaluateOnNewDocument", {"source": js_source()})
         self.conn.evaluate(js_source())
-        self._pump_installed = bool(
-            self.conn.evaluate("!!(window.__ash && __ash.pump.install())")
-        )
+        if self.drive == "realtime":
+            # Leave the engine's own loop alone.  Measured on this game: a
+            # hand-driven ticker pins the hurt state (_pRealState 6) forever -
+            # 1200 pumped frames never left it - so the character cannot move
+            # and a damage trap never resolves, while the same trap teleports
+            # correctly when the engine drives itself.  Self-play needs the
+            # game to behave normally far more than it needs determinism.
+            # Start the engine's loop, not merely "stop owning it".  Calling
+            # pump.uninstall(true) here is NOT enough: it early-returns when the
+            # freshly injected agent has no pump installed, which is exactly the
+            # case after a previous run left the ticker stopped - the round then
+            # ran a whole 40 steps against a frozen game and nothing the agent
+            # did had any effect.  pump.resume() releases a pump if one exists
+            # and starts the ticker either way.
+            resumed = self.conn.evaluate(
+                "JSON.stringify(window.__ash ? __ash.pump.resume()"
+                " : {resumed:false, reason:'no __ash'})"
+            )
+            self._pump_installed = False
+            self._ticker_resumed = bool(json.loads(resumed).get("resumed")) if resumed else False
+        else:
+            self._pump_installed = bool(
+                self.conn.evaluate("!!(window.__ash && __ash.pump.install())")
+            )
         self._rng_enabled = bool(
             self.conn.evaluate(
                 "!!(window.__ash && __ash.rng.enable(%d))" % int(seed or self.seed_value)
@@ -169,6 +204,19 @@ class CdpSpeedrunEnv:
                         self.conn.evaluate(
                             "window.__ash && __ash.pump.uninstall(%s)"
                             % ("true" if resume else "false")
+                        )
+                    except CdpError:
+                        pass
+                elif self.drive == "realtime" and not resume:
+                    # No pump to uninstall, so pause the only way left: stop the
+                    # engine's own ticker.  The paused exit is deliberate - an
+                    # unattended character standing where the run ended is beaten
+                    # to death - and it must not silently become "keep playing"
+                    # just because the drive mode changed.
+                    try:
+                        self.conn.evaluate(
+                            "(window.Graphics&&Graphics.app&&Graphics.app.ticker)"
+                            "?(Graphics.app.ticker.stop(),true):false"
                         )
                     except CdpError:
                         pass
@@ -328,6 +376,25 @@ class CdpSpeedrunEnv:
         if reason:
             raise UnsafeSceneError("refusing to dispatch input: %s" % reason)
 
+    def step_realtime(self, action: int, duration_s: float) -> None:
+        """Hold an action for `duration_s` of real time, then release it.
+
+        The engine keeps its own loop, so frames advance without help; all this
+        does is keep the buttons down long enough for the game to sample them.
+        Releasing immediately would let every frame see an idle keyboard (the
+        ordering bug `step_frame` documents), and holding across frames is also
+        what variable-height jumps need.
+        """
+        if self.conn is None:
+            raise CdpError("not connected")
+        self._check_safe()
+        bindings = self._bindings_for(action)
+        for binding in bindings:
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
+        time.sleep(max(0.0, float(duration_s)))
+        for binding in bindings:
+            self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+
     def apply_action(self, action: int, *, settle_ms: float | None = None) -> None:
         """Press the buttons of an action mask, then release them.
 
@@ -366,6 +433,12 @@ class CdpSpeedrunEnv:
             raise CdpError("not connected")
         self._check_safe()
         count = max(1, int(frames))
+        if self.drive == "realtime":
+            # The engine advances its own frames; hold the buttons for the
+            # action's duration of REAL time so it samples them across several
+            # of its frames.
+            self.step_realtime(action, self.config.frame_ms * count / 1000.0)
+            return count
         if self._pump_installed:
             bindings = self._bindings_for(action)
             if bindings:
@@ -1111,6 +1184,22 @@ class CdpSpeedrunEnv:
             return "safety probe failed (%s)" % (str(exc)[:120],)
         if not info:
             return "safety probe unavailable: agent.js not installed"
+        if info.get("awaitingChoice"):
+            # A choice is a decision, and ok answers it.  The scene being
+            # Scene_Map does not make this safe: the policy's jump key IS the
+            # ok key, so free input would pick whichever option is highlighted -
+            # a difficulty setting, a yes/no, a destination.  Refusing here is
+            # the whole point; the choice must be made deliberately, never by
+            # the layer whose only job is to say whether input is allowed.
+            return "a dialogue choice is awaiting an answer (decision point)"
+        if self.drive == "realtime" and not info.get("tickerRunning"):
+            # Acting against a frozen game is worse than not acting: the round
+            # looks healthy, reports steps, and collects a still picture.  That
+            # silently wasted a whole verification round.
+            return (
+                "the engine's ticker is not running, so a realtime round would "
+                "act against a frozen game (resume it, or the drive mode is wrong)"
+            )
         if not info.get("inGameplay"):
             return "scene %r is not Scene_Map gameplay" % (info.get("scene"),)
         return None
@@ -1153,11 +1242,28 @@ class CdpSpeedrunEnv:
                 "press_ok refused: scene %r is not in the confirm allow-list"
                 % (self.safety().get("scene"),)
             )
-        for binding in self._bindings_for(self._confirm_mask()):
+        mask = self._confirm_mask()
+        for binding in self._bindings_for(mask):
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "rawKeyDown"))
-        for binding in self._bindings_for(self._confirm_mask()):
+        # The engine samples Input on the frames it runs, so the key has to be
+        # DOWN across a frame and released on a later one.  Dispatching down and
+        # up back-to-back lets every frame see an idle keyboard and the confirm
+        # edge never registers - the same ordering bug step_frame documents.
+        self._pump_frames(1)
+        for binding in self._bindings_for(mask):
             self.conn.call("Input.dispatchKeyEvent", self._key_params(binding, "keyUp"))
+        self._pump_frames(1)
         return True
+
+    def _pump_frames(self, count: int) -> int:
+        """Advance `count` game frames without pressing anything."""
+        if self.conn is None:
+            raise CdpError("not connected")
+        if self._pump_installed:
+            return int(
+                self.conn.evaluate("window.__ash.pump.pump(%d)" % count, timeout=30.0) or 0
+            )
+        return 0
 
     def game_frame_count(self) -> int:
         if self.conn is None:

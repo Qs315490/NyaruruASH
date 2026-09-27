@@ -29,15 +29,21 @@
    选项——**首次实机自举就是这样进入了玩家的存档**。因此：
    - 只在 `Scene_Map` 内派发按键：`agent.js` 的 `V.safety()` → `cdp_backend.unsafe_reason()`
      → `_check_safe()`（`apply_action`/`step_frame` 的硬闸），读不到场景一律**失败即拒**；
+   - **`Scene_Map` 还不够**：对话框正在**等待选项**时（`$gameMessage._choiceCallback`
+     或 `choices()` 非空且 `isBusy()`）也是决策点——确定键就是策略的跳跃键，自由输入会替你
+     选中高亮项（难度雕像、yes/no 都在此列）。`safety().awaitingChoice` 为真时一并拒绝。
    - 不许为了「先跑起来」关掉护栏，也不许新开一条绕过 `_check_safe()` 的按键派发路径；
      诊断探针确需原始按键时必须显式 `enforce_safety=False` 并写明理由；
-   - **唯一的例外是 `V.CONFIRM_SCENES` 白名单**（目前只有 `Scene_Transport`，游戏自己的
-     过场画面）。这类画面**不会自己结束、必须按一次确定**，所以「一律不按键」不是保护
-     而是把游戏永久停在那里（实测发生过）。白名单场景只允许 `press_ok()`：**只按
-     keymap 里的确定键**（`interact`/`jump`），绝不按随机动作，且 `max_confirm_presses`
-     有上限，超过就中止。**菜单类（Scene_Title/Scene_Menu/Scene_File/Scene_Load/
-     Scene_Save…）永远不得进白名单**——那里的确定就是「选中菜单项」。白名单只有
-     `agent.js` 一处定义，避免漂移。
+   - **`V.CONFIRM_SCENES` 目前是空列表，而且必须保持为空**，直到某个场景被**证明**
+     只需要一次 ok 且 ok 不做任何提交。机制本身留着（`press_ok()`：只按 keymap 的确定键，
+     有 `max_confirm_presses` 上限），但名单为空。
+     **反例（务必记住）**：`Scene_Transport` 曾被放进这个名单，理由是「它是游戏的过场
+     画面、需要按一次确定」。它其实是**选择传送点的菜单**——ok 在那里就是选传送目标，
+     于是 agent 选了它根本没选的落点、把角色扔到伤害陷阱上。这正是这道门槛存在的意义。
+     **判据是「ok 会不会提交选择」，不是「画面看起来无害」**。菜单类
+     （`Scene_Title`/`Scene_Menu`/`Scene_File`/`Scene_Load`/`Scene_Save`/`Scene_Transport`…）
+     永远不得进白名单；`tests/test_confirm_scenes.py` 直接在 node 里加载真实的
+     `agent.js` 读这份名单（不是读一份副本），并逐个钉死这些菜单不在里面。
    - 实机启动前 CLI 会先查一次场景，不在游戏内且不在白名单里就拒绝启动（退出码 3）；
    - **退出时保持暂停是刻意的，不要「修」成自动恢复**。`close(resume=False)` 停掉
      ticker，为的是不让角色在无人操作时被敌人打死。代价是「跑完游戏像卡住了」，所以
@@ -56,6 +62,19 @@
    IDM 就已经 97% 输出同一个类。在常数目标上训 π 只会把它教成「永远输出同一个动作」，
    而 `policy_val ~1e-6` 看起来像收敛。`bootstrap.pseudo_label_stats` +
    `max_pseudo_majority=0.9` 会跳过更新并报错，由 `tests/test_pseudo_labels.py` 钉死。
+
+9. **实机自博弈必须用 `drive="realtime"`，不许用帧泵**。帧泵是「手工驱动 ticker」，
+   为**确定性回放/搜索**而设，它会**改变被观测的游戏**。同一陷阱、同一角色实测：
+
+   | 驱动方式 | `_pRealState` | 陷阱是否传送 |
+   | --- | --- | --- |
+   | 引擎自己的 ticker | `3→6→1→0→9→4→7…` 正常流转 | **会**（`map 8 (0,8)` → `map 14 (0,18)`）|
+   | 帧泵（`ticker.update(合成时钟)`） | 1200 帧**全程钉在 6** | **不** |
+
+   后果：帧泵驱动下采到的实机轨迹是「一个动不了的角色」，IDM 自然学不到输入相关的
+   动态——**这比 IDM 数据量的问题更上游**。自博弈要的是「不改变系统」，不是确定性；
+   确定性只对回放/搜索有意义。`tests/test_drive_mode.py` 钉死两种模式不得混同
+   （realtime 不装帧泵、按真实时间按持键；pump 仍可用于回放）。
 
 ## 架构速览
 
@@ -80,12 +99,14 @@ uv sync
 .venv/bin/python -m pytest tests -q
 ```
 
-73 项全过才算改动成立。四个测试文件各钉死一类静默失败：
+99 项全过才算改动成立。四个测试文件各钉死一类静默失败：
 - `tests/test_loop.py`：三个动作维度（BUTTONS / ActionSpace / 策略类别数）必须同源、
   轨迹的 `act` 是「每个转移一个标签」（长度 T-1，不是 T）、策略训练目标是窗口内每个
   位置、bootstrap 必须按 D^R 裁剪语料（否则检索是空操作）。
 - `tests/test_safety.py`：实机输入护栏三层（场景探针失败即拒 / 后端硬闸不派发按键 /
-  runner 中止该轮）+ 退出保持暂停 + 确认白名单只按确定键且菜单场景被拒。
+  runner 中止该轮）+ 退出保持暂停 + 等待选项的对话框被拒（难度雕像）。
+- `tests/test_confirm_scenes.py`：`CONFIRM_SCENES` 为空，且传送菜单等菜单类不在其中。
 - `tests/test_time_scale.py`：`control_interval_s` 派生出的 agent 步长与语料抽帧率必须
   一致，CLI 不一致时拒绝启动。
 - `tests/test_pseudo_labels.py`：伪标签退化成常数时不得更新 π，且必须报告。
+- `tests/test_drive_mode.py`：实机自博弈不得接管引擎 ticker（帧泵会改变游戏行为）。

@@ -74,6 +74,69 @@
     - 其余（标题/菜单/读档/存档/未知）→ 绝对禁止，菜单里的确定就是「选中菜单项」。
     白名单只有一处定义，菜单类永远不得加入（`tests/test_safety.py` 钉死）。
 
+14. **绝不要把游戏留在「有伤害来源」的地方无人运行**（这次真的把角色玩死了）。
+    角色卡在伤害柱里持续掉血时，我为了验证「陷阱应该传送」把 ticker 交还引擎并让它跑，
+    结果血扣到 0、进 `Scene_Gameover`。**观察到「位置 10 秒不变」时就该立刻停住**，
+    而不是继续让它跑着「观察」。默认的 `close(resume=False)`（保持暂停）才是安全的，
+    `resume=True` 只应在**人马上接手**时用。
+    - 顺带查清：这个陷阱不会自动传送；角色的 `_pRealState=6/10` 是**受伤态**，
+      连续命中会不断刷新 `_invincibleTime`，所以没有可操作窗口。玩家给的破法是
+      「按 2 次 C 冲过去」或「受伤后起跳」，说明**移动输入本身是正常的**。
+    - `Scene_Gameover` 的恢复（本游戏自定义）：`pressBoxOk()` 读 `_selectBox.selectedButton()`，
+      `"up"` → 读档，`"down"` → `backToTown()`。直接调 `backToTown()` 若死亡动画已结束会
+      在 `removeChild` 上抛错，要**带 null 判断**重做那四步（removeChild / destroy /
+      clearPictures / `Utils.backToTown()`）才会成功。实测恢复后回到城镇地图 6。
+
+15. **`Scene_Map` 不等于「可以随便按」：等待选项的对话框是决策点**。难度是靠一座
+    **难度雕像**的对话框选的，而策略的跳跃键（Z）就是确定键——自由输入会替你选中高亮项。
+    原来的护栏只看「场景是不是 Scene_Map」，所以这个场景**照样会被盲选**。
+    修法：`V.safety()` 新增 `awaitingChoice`（`$gameMessage._choiceCallback` 存在，
+    或 `choices()` 非空且 `isBusy()`），为真时 `unsafe_reason()` 直接返回理由 → 该轮中止。
+    普通对话（无选项）不受影响，仍是正常 gameplay。
+    结论：**决策点要按「ok 会不会替你提交选择」来判断，不是按场景判断**。本游戏已知的
+    决策点至少两个：传送点选择菜单（`Scene_Transport`）、难度雕像对话框。两者都必须由
+    **策略**或人来决定，安全层永不代选。
+
+16. **重启游戏的正确做法，以及一个匹配错目标的实例**。
+    步骤（沙箱内看不到游戏进程，要用提权）：
+    1. 找到**游戏本体**的 PID（`nw.exe` 且带 `--remote-debugging-port` 且**不含 `--type=`**
+       且**不含 `proton`**），连同它的 `steam.exe` 包装进程一起，用 `kill <pid>` 逐个发 TERM；
+    2. 确认 `ps` 里再没有 `nw.exe`、且 `curl :9222/json/version` 已断；
+    3. `rm -rf .nw-profile/SingletonLock`；
+    4. `./scripts/launch_nw_proton.sh`（后台，需提权），再等 CDP 起。
+    坑：模式 `/nw\.exe/ && /--remote-debugging-port/` **会同时匹配 Proton 启动器**——它的
+    命令行里就是 `proton run Z:.../nw.exe Z:... --remote-debugging-port=9222 ...`。我第一次
+    就因此打到了错误的 PID，游戏本体没停。**必须额外排除 `proton` 和 `--type=`**。
+    验证重启是否干净：`typeof window.__ash === "undefined"`（无旧注入残留）+
+    `SceneManager._scene` 有值 + `Graphics.frameCount` 在推进。
+
+17. **帧泵会改变游戏行为——这不是理论，是同场景 A/B 实测**。
+    角色站在伤害陷阱上，只换驱动方式：
+    - **真实 ticker**：`_pRealState` 在 `3→6→1→0→9→4→7` 之间正常流转；站了约 25 秒后
+      **陷阱把它传送走**（`map 8 (0,8)` → `map 14 (0,18)`，正是它上次落脚的地方）。
+    - **帧泵**：`_pRealState` **1200 帧全程钉在 6**（受伤态），`inv` 被反复刷新，
+      **20 秒游戏时间过去陷阱始终不结算、角色无法移动**。
+    机制上说得通：帧泵用 `ticker.update(V.pump.time)` 推进一个**只在自己手上走的合成时钟**，
+    墙钟/真实 ticker 语义随之失真，依赖它们的动画完成回调与状态退出条件就跑不完。
+    后果（这是最重要的一点）：**帧泵驱动下的实机轨迹是「一个动不了的角色」**，
+    `key_moments=[0]`、IDM 只学到类别偏置，都在这条链的下游。
+    修法：自博弈用 `drive="realtime"`（不装帧泵、按真实时间按持键），帧泵只留给确定性回放。
+    `tests/test_drive_mode.py` 钉死。
+
+18. **「角色动不了」可能是「站在空地图上」——而这是第三次因为「没追一条已有的证据」
+    而误判**。这次实测：`$gamePlayer` 停在 `map 4`（11×9、`tilesetId=0`、`displayName` 为空、
+    **99 个图块里 0 个有图形**、note 里是 `<layer name:Map004-shadow,...>`），也就是这个游戏
+    内部的**过渡/阴影空地图**。在空地图上谁都走不动，`isMoving()` 恒 false、坐标恒不变，
+    连玩家自己用键盘也一样。
+    教训：**`tileId`/`isPassable` 这类「周围环境」证据要第一时间追下去**。我在很早就量到
+    「六个 tile 图层全 0」，却把它当成无关细节跳过了，随后又花了好几轮去怀疑输入通路、
+    怀疑 CDP 事件、怀疑帧泵。当时的正确动作是：一旦怀疑「输入没生效」，就先确认
+    **角色所在的地图是否存在**。
+    排查口诀：`$gameMap.width()/height()/tilesetId` + 全图图块计数；`$gamePlayer.canMove()`；
+    `$gameMap._interpreter.isRunning()` + `$gameMessage.isBusy()`；`Graphics.app.ticker.started`。
+    这四项任一异常，就是「环境问题」而不是「输入问题」。
+    出口：这个游戏自带 `Utils.backToTown()`（实测能回到城镇地图 6 @ (11,9)）。
+
 ## 历史踩坑实录（详见 docs/game-architecture.md）
 
 - 快照/回滚 5 个致命缺陷（canonicalNumbering、单段路径、函数占位符、

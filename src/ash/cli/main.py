@@ -79,7 +79,17 @@ def _make_env(backend: str):
     from ash.memory.embeddings import DEFAULT_IMAGE_SIZE
 
     if backend == "cdp":
-        return make_env(backend, resize=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
+        # drive="realtime": never take the engine's loop away from it.  Measured
+        # with the frame pump, this game's hurt state pins at _pRealState 6 and a
+        # trap that teleports correctly under the engine's own loop never
+        # resolves - so a pumped self-play run collects trajectories of a
+        # character that cannot move.  Determinism is not worth that here; it is
+        # needed for replay/search, not for gathering behaviour.
+        return make_env(
+            backend,
+            resize=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
+            drive="realtime",
+        )
     return make_env(backend)
 
 
@@ -127,6 +137,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         "control interval %.3f s -> %d game frames/action, corpus %.3f fps",
         game.control_interval_s, game.control_frame_skip, game.corpus_fps,
     )
+    if args.backend == "cdp":
+        # Say which drive mode the round will use: the difference is not
+        # cosmetic (a hand-driven ticker pins this game's hurt state and the
+        # trap never resolves), so it must be visible in every run's log.
+        log.info("live drive mode: realtime (engine keeps its own ticker)")
     mismatch = _check_corpus_interval(args.corpus, game.corpus_fps)
     if mismatch:
         log.error("corpus/agent time scales disagree: %s", mismatch)
