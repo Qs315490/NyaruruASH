@@ -218,21 +218,88 @@ class CdpSpeedrunEnv:
                     except CdpError:
                         pass
                 elif self.drive == "realtime" and not resume:
-                    # No pump to uninstall, so pause the only way left: stop the
-                    # engine's own ticker.  The paused exit is deliberate - an
-                    # unattended character standing where the run ended is beaten
-                    # to death - and it must not silently become "keep playing"
-                    # just because the drive mode changed.
-                    try:
-                        self.conn.evaluate(
-                            "(window.Graphics&&Graphics.app&&Graphics.app.ticker)"
-                            "?(Graphics.app.ticker.stop(),true):false"
-                        )
-                    except CdpError:
-                        pass
+                    # No pump to uninstall.  The paused exit is deliberate - an
+                    # unattended character is beaten to death - and it must not
+                    # silently become "keep playing" just because the drive mode
+                    # changed.
+                    #
+                    # `ticker.stop()` alone is NOT a pause: measured, the ticker
+                    # came back about two seconds later because the engine calls
+                    # `Graphics._app.start()` on its own, so a stopped agent left
+                    # the character in a monster area being killed.  `pauseGame`
+                    # also shadows the ticker's start() while the agent holds the
+                    # loop, which is what makes it stay stopped.
+                    self._pause_ticker_verified()
                 self.conn.close()
         finally:
             self.conn = None
+
+    #: Reads the engine ticker without the agent, so a status check does not
+    #: itself start it (installing the agent in realtime mode starts the loop).
+    _TICKER_EXPR = (
+        "(function(){try{var t=window.Graphics&&Graphics.app&&Graphics.app.ticker;"
+        "return JSON.stringify({started:!!(t&&t.started),"
+        " guarded:!!(t&&t.__ashGuarded),"
+        " frames:(window.Graphics&&Graphics.frameCount)||null});}catch(e){"
+        "return null;}})()"
+    )
+
+    def ticker_state(self) -> dict[str, Any]:
+        """The engine loop's state, readable with or without the agent."""
+        if self.conn is None:
+            return {}
+        raw = self.conn.evaluate(self._TICKER_EXPR)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {}
+
+    def is_paused(self, *, settle_s: float = 0.8) -> bool:
+        """True when the loop is stopped AND stays stopped.
+
+        One read right after stop() is not evidence: the engine restarts the
+        ticker by itself, and a single sample cannot tell "paused" from "about
+        to resume".  Waiting and reading again is the difference."""
+        if self.ticker_state().get("started"):
+            return False
+        time.sleep(max(0.0, settle_s))
+        return not self.ticker_state().get("started")
+
+    def pause_game(self) -> dict[str, Any]:
+        """Stop the loop and hold it stopped.  Verified, never assumed.
+
+        Returns {"paused", "guarded", "reason"}.  Uses `__ash.pauseGame()` when
+        the agent is installed (it shadows the ticker's start(), without which
+        the engine resumes the game on its own - measured, ~2 s), and falls back
+        to a plain stop for a page where the agent is not injected."""
+        out: dict[str, Any] = {"paused": False, "guarded": False, "reason": None}
+        if self.conn is None:
+            out["reason"] = "not connected"
+            return out
+        try:
+            self.release()
+            raw = self.conn.evaluate(
+                "(window.__ash&&__ash.pauseGame)?JSON.stringify(__ash.pauseGame()):"
+                "((window.Graphics&&Graphics.app&&Graphics.app.ticker)?"
+                "(Graphics.app.ticker.stop(),"
+                "JSON.stringify({paused:true,guarded:false,fallback:true})):null)"
+            )
+            out.update(json.loads(raw) if raw else {})
+        except (CdpError, ValueError) as exc:
+            out["reason"] = str(exc)[:120]
+            return out
+        if not self.is_paused():
+            out["paused"] = False
+            out["reason"] = out.get("reason") or "the ticker restarted after being stopped"
+            log.warning("pause did not hold: %s", out["reason"])
+        return out
+
+    def _pause_ticker_verified(self) -> None:
+        out = self.pause_game()
+        if not out.get("paused"):
+            log.warning("game may still be running after close(): %s", out.get("reason"))
 
     def resume_game(self) -> bool:
         """Hand the game loop back to the engine and let the game run.
@@ -538,7 +605,7 @@ class CdpSpeedrunEnv:
                 return True
         return False
 
-    def resolve_gameover(self, *, max_presses: int = 6) -> dict[str, Any]:
+    def resolve_gameover(self, *, max_presses: int = 12) -> dict[str, Any]:
         """Move the GAME OVER cursor onto the save load and commit it.
 
         Returns {"resolved", "presses", "reason"}.  Same contract as
@@ -546,6 +613,11 @@ class CdpSpeedrunEnv:
         entry the policy already allows, the presses are bounded, and success is
         verified by re-reading the scene instead of assumed - "I pressed up then
         ok" is not evidence that the game left the screen.
+
+        Measured on the real game: a death with the cursor on the refused entry
+        resolved in SIX presses, i.e. it used the whole budget of 6 - the load
+        needs a few confirms to take effect, so the bound has margin now (12)
+        rather than being one unlucky frame away from giving up.
 
         The presses go through `_dispatch`, not `step_frame`: `step_frame` runs
         the ordinary gate, which refuses this screen by design, and refusing to

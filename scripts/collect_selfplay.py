@@ -140,7 +140,13 @@ def main() -> int:
     print("  %-16s %.1f%%" % ("人动/画面也动", 100 * report["share_own_moved"]))
     print("  %-16s %s" % ("完全无变化", "%.1f%%" % (100 * (report["share_nothing_changed"] or 0))))
     print("\n写入 %s（%.1f MB）" % (path, path.stat().st_size / 1e6))
-    env.close(resume=True)
+    # Leave the game PAUSED.  `close()` pauses by default, and resuming here
+    # was a real bug: the character was left standing in the world after
+    # every probe and collection, and the enemies killed it while nobody was
+    # driving (measured: hp 150 -> 0 and a GAME OVER screen left sitting).
+    # `ash record` resumes because the player is driving and wants the game
+    # back; an unattended agent run must not.
+    env.close(resume=False)
     return 0
 
 

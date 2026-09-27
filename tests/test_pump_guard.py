@@ -102,3 +102,47 @@ def test_a_live_agent_still_holds_the_loop_while_the_pump_is_installed():
     )
     assert out["installed"] is True
     assert out["startedFlag"] is False, "start() must stay a no-op under the pump"
+
+
+def test_pause_game_holds_the_loop_against_the_engines_own_restart():
+    """A plain `ticker.stop()` is NOT a pause.  Measured on the real game: the
+    ticker came back about two seconds later, because the engine calls
+    `Graphics._app.start()` on its own, so a stopped agent left the character
+    standing in a monster area being killed.
+
+    `__ash.pauseGame()` shadows the ticker's start() while `V.paused` is held, so
+    the engine's restart is a no-op.  This pins that, because the first version
+    of the shadow read `live.pump.paused` - a property that does not exist - and
+    therefore let every restart through while LOOKING correct.
+    """
+    out = _run(
+        """
+        var t = global.ticker;
+        t.started = true;
+        var r = __ash.pauseGame();
+        // The engine's own restart path, exactly what Graphics._app.start() does.
+        t.start();
+        return {paused: r.paused, afterEngineStart: t.started,
+                guarded: !!t.__ashGuarded, flag: __ash.paused};
+        """
+    )
+    assert out["paused"] is True, out
+    assert out["flag"] is True, out
+    assert out["guarded"] is True, out
+    assert out["afterEngineStart"] is False, (
+        "the engine restarted the loop while the agent was holding it paused: %s" % out)
+
+
+def test_resume_clears_the_pause_hold():
+    """`resume()` must release the hold, or its own start() is refused."""
+    out = _run(
+        """
+        var t = global.ticker;
+        t.started = true;
+        __ash.pauseGame();
+        var r = __ash.pump.resume();
+        return {resumed: r.resumed, started: t.started, flag: __ash.paused};
+        """
+    )
+    assert out["flag"] is False, out
+    assert out["started"] is True and out["resumed"] is True, out

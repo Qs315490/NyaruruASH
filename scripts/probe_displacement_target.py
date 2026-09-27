@@ -53,7 +53,12 @@ GRAD_CLIP = 1.0
 TRAIN_FRACTION = 0.7
 
 
-def load(path: str):
+def pairs_of(path: str):
+    """(a, b, acts, dpx, dpy, vx, vy) for one session.
+
+    Pairs are built INSIDE a session and only then concatenated, so no phantom
+    transition is created across the seam between two recordings.
+    """
     z = np.load(path, allow_pickle=True)
     frames = z["frames"]
     acts = z["acts"].astype(np.int64)
@@ -70,65 +75,76 @@ def load(path: str):
         dpy[t] = float(b.get("py") or 0) - float(a.get("py") or 0)
         vx[t] = float(b.get("vx") or 0)
         vy[t] = float(b.get("vy") or 0)
-    return frames, acts, dpx, dpy, vx, vy
+    return frames[:-1], frames[1:], acts, dpx, dpy, vx, vy
 
 
-def teacher_ceiling(acts, dpx, dpy, vx, vy, train, test) -> dict:
-    """How much of the action is readable from the teacher's own numbers?"""
+def teacher_ceiling(y_tr, x_tr, y_te, x_te) -> dict:
+    """How much of the action is readable from the teacher's own numbers?
+
+    Takes the two sides explicitly.  An earlier version indexed a single array
+    with the train/test index sets while the arrays had already been split, which
+    raised IndexError the moment the split stopped being one session.
+    """
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    x = np.stack([dpx, dpy, vx, vy], axis=1)
-    sc = StandardScaler().fit(x[train])
+    sc = StandardScaler().fit(x_tr)
     clf = LogisticRegression(max_iter=400)
-    clf.fit(sc.transform(x[train]), acts[train])
-    pred = clf.predict(sc.transform(x[test]))
-    classes = np.unique(acts[test])
-    recalls = [float((pred[acts[test] == c] == c).mean()) for c in classes if (acts[test] == c).any()]
-    base = float(np.bincount(acts[test]).max() / len(acts[test]))
-    return {"acc": float((pred == acts[test]).mean()), "chance": 1.0 / len(classes),
+    clf.fit(sc.transform(x_tr), y_tr)
+    pred = clf.predict(sc.transform(x_te))
+    classes = np.unique(y_te)
+    recalls = [float((pred[y_te == c] == c).mean()) for c in classes if (y_te == c).any()]
+    base = float(np.bincount(y_te).max() / len(y_te))
+    return {"acc": float((pred == y_te).mean()), "chance": 1.0 / len(classes),
             "baseline": base, "macro_recall": float(np.mean(recalls)), "n_classes": len(classes)}
 
 
-def vision_targets(dev, frames, acts, dpx, dpy, train, test, tag: str) -> dict:
+def vision_targets(dev, tr, te, tag: str) -> dict:
+    """Train on `tr` and score on `te`, each a tuple of arrays.
+
+    Both sides are passed explicitly because an earlier version took the target
+    arrays from ONE session and indexed them with the other session's indices:
+    with train and test the same length it did not raise, it trained on the test
+    targets, and the leak showed up as two different splits reporting identical
+    numbers to three decimals.  A split that cannot fail loudly has to be
+    impossible to write by accident, so the data now travels as tuples.
+    """
+    a_tr, b_tr, y_tr, dpx_tr, dpy_tr = tr
+    a_te, b_te, y_te, dpx_te, dpy_te = te
     torch.manual_seed(0)
     np.random.seed(0)
     model = IdmModel(IdmConfig(image_size=SIZE, num_actions=len(ActionSpace.minimal()))).to(dev)
-    # 生产特征是 [ea, eb, eb - ea]（trunk 输出），不是 IdmModel.forward 的动作 logits：
-    # 后者已经过了一个头，再套一层就等于在 logits 上学习。
     n_feat = model.config.embed_dim * 3
     if tag == "action":
         head = nn.Linear(n_feat, len(ActionSpace.minimal())).to(dev)
         loss_fn: nn.Module = nn.CrossEntropyLoss()
-        target = torch.from_numpy(acts).to(dev)
+        target = torch.from_numpy(y_tr).to(dev)
     else:
         head = nn.Linear(n_feat, 2).to(dev)
         loss_fn = nn.MSELoss()
-        mu = np.stack([dpx, dpy], axis=1)[train].mean(axis=0)
-        sd = np.stack([dpx, dpy], axis=1)[train].std(axis=0) + 1e-6
-        target = torch.from_numpy(((np.stack([dpx, dpy], axis=1) - mu) / sd).astype(np.float32)).to(dev)
-        model.register_buffer("_mu", torch.from_numpy(mu.astype(np.float32)))
-        model.register_buffer("_sd", torch.from_numpy(sd.astype(np.float32)))
+        stacked = np.stack([dpx_tr, dpy_tr], axis=1)
+        mu, sd = stacked.mean(axis=0), stacked.std(axis=0) + 1e-6
+        target = torch.from_numpy(((stacked - mu) / sd).astype(np.float32)).to(dev)
 
     params = list(model.trunk.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=LR)
-    order = np.arange(len(train))
+    idx_all = np.arange(len(y_tr))
     rng = np.random.default_rng(0)
 
-    def forward(idx):
-        a = torch.from_numpy(_prep(frames[idx], SIZE)).to(dev)
-        b = torch.from_numpy(_prep(frames[idx + 1], SIZE)).to(dev)
-        ea = model.trunk(a.unsqueeze(1)).squeeze(1)
-        eb = model.trunk(b.unsqueeze(1)).squeeze(1)
+    def forward(x, y, idx):
+        xb = torch.from_numpy(_prep(x[idx], SIZE)).to(dev)
+        yb = torch.from_numpy(_prep(y[idx], SIZE)).to(dev)
+        ea = model.trunk(xb.unsqueeze(1)).squeeze(1)
+        eb = model.trunk(yb.unsqueeze(1)).squeeze(1)
         return head(torch.cat([ea, eb, eb - ea], dim=1))
 
     for epoch in range(EPOCHS):
-        rng.shuffle(order)
+        rng.shuffle(idx_all)
         total, seen = 0.0, 0
         model.train()
-        for i in range(0, len(order), BATCH):
-            idx = train[order[i : i + BATCH]]
-            loss = loss_fn(forward(idx), target[idx])
+        for i in range(0, len(idx_all), BATCH):
+            idx = idx_all[i : i + BATCH]
+            loss = loss_fn(forward(a_tr, b_tr, idx), target[idx])
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(params, GRAD_CLIP)
             opt.step()
@@ -136,20 +152,22 @@ def vision_targets(dev, frames, acts, dpx, dpy, train, test, tag: str) -> dict:
         print("    [%s] epoch %d train %.4f" % (tag, epoch, total / max(1, seen)), flush=True)
 
     model.eval()
+    test_idx = np.arange(len(y_te))
     with torch.inference_mode():
-        out = torch.cat([forward(test[i : i + 64]) for i in range(0, len(test), 64)])
+        out = torch.cat([forward(a_te, b_te, test_idx[i : i + 64])
+                         for i in range(0, len(test_idx), 64)])
 
     if tag == "action":
         pred = out.argmax(dim=1).cpu().numpy()
-        y = acts[test]
-        classes = np.unique(y)
-        recalls = [float((pred[y == c] == c).mean()) for c in classes if (y == c).any()]
-        return {"acc": float((pred == y).mean()), "macro_recall": float(np.mean(recalls)),
-                "baseline": float(np.bincount(y).max() / len(y)), "chance": 1.0 / len(classes),
-                "pred_noop": float((pred == 0).mean()), "true_noop": float((y == 0).mean())}
+        classes = np.unique(y_te)
+        recalls = [float((pred[y_te == c] == c).mean()) for c in classes if (y_te == c).any()]
+        return {"acc": float((pred == y_te).mean()), "macro_recall": float(np.mean(recalls)),
+                "baseline": float(np.bincount(y_te).max() / len(y_te)),
+                "chance": 1.0 / len(classes), "pred_noop": float((pred == 0).mean()),
+                "true_noop": float((y_te == 0).mean())}
 
-    pred = (out.cpu().numpy() * sd + mu)
-    true = np.stack([dpx, dpy], axis=1)[test]
+    pred = out.cpu().numpy() * sd + mu
+    true = np.stack([dpx_te, dpy_te], axis=1)
     out_d: dict[str, object] = {}
     for j, axis in enumerate(("dpx", "dpy")):
         mse = float(((pred[:, j] - true[:, j]) ** 2).mean())
@@ -164,48 +182,52 @@ def vision_targets(dev, frames, acts, dpx, dpy, train, test, tag: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("path")
-    ap.add_argument("--train-fraction", type=float, default=TRAIN_FRACTION)
+    ap.add_argument("--train", nargs="+", required=True, help="训练会话 npz（可多个）")
+    ap.add_argument("--test", required=True, help="留出会话 npz")
     args = ap.parse_args()
 
     dev = resolve_device("cuda")
-    frames, acts, dpx, dpy, vx, vy = load(args.path)
-    n = len(acts)
-    cut = int(args.train_fraction * n)
-    train = np.arange(cut)
-    test = np.arange(cut, n)
-    print("数据 %s：%d 个转移，时间序切分（前 %d 训练 / 后 %d 测试）"
-          % (Path(args.path).name, n, len(train), len(test)))
-    print("位移真值：dpx 中位 %.1f（std %.1f）| dpy 中位 %.1f（std %.1f）| 真 noop 比例 %.1f%%"
-          % (np.median(dpx), dpx.std(), np.median(dpy), dpy.std(),
-             100 * (acts == 0).mean()))
+    cols = list(zip(*[pairs_of(q) for q in args.train]))
+    a_tr = np.concatenate(cols[0]); b_tr = np.concatenate(cols[1])
+    acts_tr = np.concatenate(cols[2]); dpx_tr = np.concatenate(cols[3])
+    dpy_tr = np.concatenate(cols[4]); vx_tr = np.concatenate(cols[5])
+    vy_tr = np.concatenate(cols[6])
+
+    a_te, b_te, acts_te, dpx_te, dpy_te, vx_te, vy_te = pairs_of(args.test)
+    print("训练 %d 对（%d 个会话）| 留出 %s %d 对"
+          % (len(acts_tr), len(args.train), Path(args.test).name, len(acts_te)))
+    print("位移真值：dpx std %.1f | dpy std %.1f | 真 noop %.1f%%"
+          % (dpx_te.std(), dpy_te.std(), 100 * (acts_te == 0).mean()))
+
+    def feats(dpx, dpy, vx, vy):
+        return np.stack([dpx, dpy, vx, vy], axis=1)
 
     print("\n=== T：只用老师的数字（Δpx, Δpy, vx, vy）判动作 ===")
-    t = teacher_ceiling(acts, dpx, dpy, vx, vy, train, test)
+    t = teacher_ceiling(acts_tr, feats(dpx_tr, dpy_tr, vx_tr, vy_tr),
+                        acts_te, feats(dpx_te, dpy_te, vx_te, vy_te))
     print("  准确率 %.1f%% | 基线 %.1f%% | 随机(按类数) %.1f%% | macro-recall %.3f | 类数 %d"
           % (100 * t["acc"], 100 * t["baseline"], 100 * t["chance"],
              t["macro_recall"], t["n_classes"]))
 
-    print("\n=== V1：像素 → 20 类动作（旧目标）===")
-    v1 = vision_targets(dev, frames, acts, dpx, dpy, train, test, "action")
+    tr_tuple = (a_tr, b_tr, acts_tr, dpx_tr, dpy_tr)
+    te_tuple = (a_te, b_te, acts_te, dpx_te, dpy_te)
+    print("\n=== V1：像素 → 20 类动作 ===")
+    v1 = vision_targets(dev, tr_tuple, te_tuple, "action")
 
-    print("\n=== V2：像素 → 玩家位移 (Δpx, Δpy)（新目标）===")
-    v2 = vision_targets(dev, frames, acts, dpx, dpy, train, test, "displacement")
+    print("\n=== V2：像素 → 玩家位移 (Δpx, Δpy) ===")
+    v2 = vision_targets(dev, tr_tuple, te_tuple, "displacement")
 
-    print("\n=== 汇总 ===")
-    print("T  老师数字→动作      %.1f%%（基线 %.1f%%）| macro-recall %.3f"
+    print("\n=== 汇总（留出会话 = %s）===" % Path(args.test).name)
+    print("T  老师数字→动作   %.1f%%（基线 %.1f%%）| macro-recall %.3f"
           % (100 * t["acc"], 100 * t["baseline"], t["macro_recall"]))
-    print("V1 像素→动作          %.1f%%（基线 %.1f%%）| macro-recall %.3f | 预测noop %.1f%%（真 %.1f%%）"
-          % (100 * v1["acc"], 100 * v1["baseline"], v1["macro_recall"],
-             100 * v1["pred_noop"], 100 * v1["true_noop"]))
+    print("V1 像素→动作       %.1f%%（基线 %.1f%%）| macro-recall %.3f"
+          % (100 * v1["acc"], 100 * v1["baseline"], v1["macro_recall"]))
     for axis in ("dpx", "dpy"):
         d = v2[axis]
-        print("V2 像素→%-3s          MSE %.1f（零预测基线 %.1f）| skill %+0.3f | corr %+0.3f"
-              " | 预测std %.1f vs 真std %.1f"
-              % (axis, d["mse"], d["baseline_mse"], d["skill"], d["corr"],
-                 d["std_pred"], d["std_true"]))
-    print("\n判读：skill<=0 或 corr≈0 ⇒ 连「画面→位移」都学不到；"
-          "T 高而 V2 低 ⇒ 瓶颈在视觉侧；T 本身就低 ⇒ 老师的数字不足以定动作，链条第二环就断了。")
+        print("V2 像素→%-3s       skill %+0.3f | corr %+0.3f | 预测std %.1f vs 真std %.1f"
+              % (axis, d["skill"], d["corr"], d["std_pred"], d["std_true"]))
+    print("\n判读：skill 明显为正且 corr 高 ⇒ 位移目标在该留出集上可学。"
+          "\n     与域内（corr 0.92）比较即可看出跨区域损失了多少。")
     return 0
 
 

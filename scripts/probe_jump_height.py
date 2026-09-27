@@ -81,7 +81,13 @@ def main() -> int:
             time.sleep(0.03)
         print("%8d %10d %12.1f %10.1f" % (hold, int(hold * 1000 / 60), apex, base - apex))
 
-    env.close(resume=True)
+    # Leave the game PAUSED.  `close()` pauses by default, and resuming here
+    # was a real bug: the character was left standing in the world after
+    # every probe and collection, and the enemies killed it while nobody was
+    # driving (measured: hp 150 -> 0 and a GAME OVER screen left sitting).
+    # `ash record` resumes because the player is driving and wants the game
+    # back; an unattended agent run must not.
+    env.close(resume=False)
     print("\n读法：如果「相对起跳点」随按住帧数上升，说明跳跃高度受按住时长控制，"
           "\n而固定 250ms 的编码就只能拿到其中一小截。")
     return 0

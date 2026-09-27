@@ -90,7 +90,13 @@ def main() -> int:
     print("\n动过的比例（|Δpx|>0）：%s"
           % {n: "%.0f%%" % (100 * np.mean(np.abs(r["dpx"]) > 0))
              for n, r in results.items()})
-    env.close(resume=True)
+    # Leave the game PAUSED.  `close()` pauses by default, and resuming here
+    # was a real bug: the character was left standing in the world after
+    # every probe and collection, and the enemies killed it while nobody was
+    # driving (measured: hp 150 -> 0 and a GAME OVER screen left sitting).
+    # `ash record` resumes because the player is driving and wants the game
+    # back; an unattended agent run must not.
+    env.close(resume=False)
     print("游戏已留在暂停态（__ash.pump.resume() 可恢复）")
     return 0
 

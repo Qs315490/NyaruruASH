@@ -92,7 +92,13 @@ def main() -> int:
             print("%34s %10.1f %12.1f" % (label, apex, base - apex))
     finally:
         env.release()
-        env.close(resume=True)
+    # Leave the game PAUSED.  `close()` pauses by default, and resuming here
+    # was a real bug: the character was left standing in the world after
+    # every probe and collection, and the enemies killed it while nobody was
+    # driving (measured: hp 150 -> 0 and a GAME OVER screen left sitting).
+    # `ash record` resumes because the player is driving and wants the game
+    # back; an unattended agent run must not.
+        env.close(resume=False)
     print("\n（单次 250ms 按住 = 172 px，最大 = 212 px，来自 probe_jump_height.py）")
     return 0
 

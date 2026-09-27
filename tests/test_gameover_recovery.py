@@ -83,6 +83,13 @@ def _env(payloads: list[dict]) -> CdpSpeedrunEnv:
     return env
 
 
+def env_max_presses() -> int:
+    """The bound the recovery promises; asserted against rather than a literal."""
+    import inspect
+
+    return inspect.signature(CdpSpeedrunEnv.resolve_gameover).parameters["max_presses"].default
+
+
 def _up_key(env: CdpSpeedrunEnv) -> str:
     from ash.actions.space import mask_from_buttons
 
@@ -129,7 +136,7 @@ def test_success_is_verified_not_assumed():
     out = env.resolve_gameover()
     assert out["resolved"] is False, out
     assert out["reason"], "a refusal must say why"
-    assert out["presses"] <= 6, "presses must stay bounded"
+    assert out["presses"] <= env_max_presses(), "presses must stay bounded"
     ok = _ok_key(env)
     assert ok not in [k for k, t in env.conn.keys if t == "rawKeyDown"], (
         "ok must not be pressed on a screen whose cursor never moved")

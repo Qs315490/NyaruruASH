@@ -16,3 +16,6 @@ __pycache__/
 .nw-profile/
 .nwjs-sdk
 .torch-home/
+data/video-src/
+runs/overlay-*/
+runs/dl-*.log

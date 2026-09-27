@@ -46,7 +46,7 @@ ROCm 版实测为 `torch 2.15.0a0+rocm10.2.0a20260924`（HIP 7.17）。
 
 ```bash
 .venv/bin/python -m ash.cli.main doctor                 # 环境自检
-.venv/bin/python -m pytest tests -q                     # 248 项回归测试
+.venv/bin/python -m pytest tests -q                     # 250 项回归测试
 .venv/bin/python -m ash.cli.main run --backend fake --delta 30 --max-steps 200
 ```
 

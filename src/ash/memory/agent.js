@@ -428,6 +428,18 @@
   /* ------------------------------------------------------------------- pump */
   V.pump = {};
   V.pump.installed = false;
+  /*: True while the agent deliberately holds the game loop stopped.
+   *
+   * Separate from `installed`, because the two ways of holding the loop differ:
+   * the pump owns the loop and drives it by hand, a plain pause merely refuses
+   * to let anyone start it again.  Measured (2026-09-26): without this flag a
+   * paused game RESUMED BY ITSELF about two seconds later - `ticker.stop()` is
+   * undone by the engine's own `Graphics._app.start()` - so "close(resume=False)
+   * leaves the game paused" did not hold in realtime mode, the only mode
+   * self-play uses.  The character was left standing in monster areas being
+   * killed, which is exactly what pausing is supposed to prevent.
+   */
+  V.paused = false;
   V.pump.pending = 0;
   V.pump.time = 0;
   V.pump.dt = 1000 / 60;
@@ -567,7 +579,7 @@
       // installed this shadow may be long gone, and reading its stale
       // `installed` flag is what kept start() a no-op forever.
       var live = window.__ash;
-      if (live && live.pump && live.pump.installed) { return this; }
+      if (live && (live.paused || (live.pump && live.pump.installed))) { return this; }
       return t.__ashStart.apply(this, arguments);
     };
     t.__ashGuarded = true;
@@ -590,6 +602,29 @@
    * resuming the loop turns "the agent stopped" into "the character is beaten
    * to death while nobody is controlling it".  Freezing is the safe state.
    * Resuming is therefore an explicit, separate call. */
+  /* Stop the engine's loop and KEEP it stopped.
+   *
+   * `ticker.stop()` alone is not enough: the engine calls `Graphics._app.start()`
+   * by itself and the ticker comes back, measured about two seconds later in
+   * realtime mode.  Holding `V.paused` makes the guard refuse that restart. */
+  V.pauseGame = function () {
+    var out = { paused: false, guarded: false, reason: null };
+    try {
+      var t = V.pump.resolvedTicker();
+      if (!t) { out.reason = "no ticker"; return out; }
+      V.paused = true;
+      V.pump.guard();
+      if (t.started) { t.stop(); }
+      out.guarded = !!t.__ashGuarded;
+      out.paused = !t.started;
+      if (!out.paused) { out.reason = "ticker still started"; }
+      return out;
+    } catch (e) {
+      out.reason = String(e);
+      V.errors.push("pauseGame: " + String(e));
+      return out;
+    }
+  };
   V.pump.resume = function () {
     var out = { resumed: false, reason: null };
     try {
@@ -599,6 +634,7 @@
       // the pump is installed, so the flag has to drop first.
       V.pump.installed = false;
       V.pump.hijacked = false;
+      V.paused = false;
       // Pass the ticker explicitly: the guard may have been left by an older
       // agent instance, which is exactly when the V.pump.ticker lookup fails.
       V.pump.unguard(t);
@@ -649,6 +685,7 @@
       V.pump.unguard();
       V.pump.installed = false;
       V.pump.hijacked = false;
+      V.paused = false;
       return true;
     }
     window.requestAnimationFrame = V.pump.origRAF;
